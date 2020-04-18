@@ -258,7 +258,6 @@ static void cgvk_init_swapchain(const cgvk_Device* dev, cgvk_Swapchain* swp)
         .clipped = VK_TRUE,
         .oldSwapchain = VK_NULL_HANDLE,
     };
-
     VkSwapchainKHR swapchain;
     result = vkCreateSwapchainKHR(dev->device, &create_info, NULL, &swapchain);
     if (result != VK_SUCCESS) {
@@ -266,12 +265,18 @@ static void cgvk_init_swapchain(const cgvk_Device* dev, cgvk_Swapchain* swp)
         abort();
     }
 
+    // Get actual image count
     result = vkGetSwapchainImagesKHR(dev->device, swapchain, &image_count, NULL);
     if (result != VK_SUCCESS) {
         log_fatal("vkGetSwapchainImagesKHR failed: %d", (int)result);
         abort();
     }
+    if (image_count > CGVK_MAX_SWAPCHAIN_IMAGE_COUNT) {
+        log_fatal("The number of the images of the swapchain exceeds the limit: %u > %u", image_count, CGVK_MAX_SWAPCHAIN_IMAGE_COUNT);
+        abort();
+    }
 
+    // Get images
     VkImage images[image_count];
     result = vkGetSwapchainImagesKHR(dev->device, swapchain, &image_count, images);
     if (result != VK_SUCCESS) {
@@ -279,6 +284,7 @@ static void cgvk_init_swapchain(const cgvk_Device* dev, cgvk_Swapchain* swp)
         abort();
     }
 
+    // Create image views
     VkImageView image_views[image_count];
     for (int i = 0, n = image_count; i < n; ++i) {
         VkImageViewCreateInfo create_info = {
@@ -309,6 +315,7 @@ static void cgvk_init_swapchain(const cgvk_Device* dev, cgvk_Swapchain* swp)
         }
     }
 
+    // Fill the fields
     swp->dev = dev;
     swp->swapchain = swapchain;
     swp->format = fmt;
@@ -316,6 +323,7 @@ static void cgvk_init_swapchain(const cgvk_Device* dev, cgvk_Swapchain* swp)
     swp->width = extent.width;
     swp->height = extent.height;
 
+    // Init images
     for (int i = 0, n = image_count; i < n; ++i) {
         cgvk_Image* img = &swp->images[i];
         img->dev = dev;
