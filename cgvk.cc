@@ -36,7 +36,8 @@ enum cgvk_Format {
     CGVK_FORMAT_UNDEFINED = 0,
     CGVK_FORMAT_B8G8R8A8_UNORM = 1,
     CGVK_FORMAT_B8G8R8A8_SRGB = 2,
-    CGVK_FORMAT_D24_UNORM_S8_SINT = 250,
+    CGVK_FORMAT_D24_UNORM_S8_UINT = 3,
+    CGVK_FORMAT_MAX = 0xFF,
 };
 
 enum cgvk_ImageLayout {
@@ -95,6 +96,9 @@ struct cgvk_Swapchain {
 static cgvk_Device dev_;
 static cgvk_Swapchain swp_;
 
+static VkFormat cgvk_decode_format(cgvk_Format fmt);
+static VkImageLayout cgvk_decode_image_layout(cgvk_ImageLayout l);
+
 // ============================================================================
 
 static void cgvk_kill_image(cgvk_Image* img)
@@ -106,6 +110,35 @@ static void cgvk_kill_image(cgvk_Image* img)
         vmaDestroyImage(img->dev->allocator, img->image, img->memory);
 
     memset(img, 0, sizeof(cgvk_Image));
+}
+
+// ============================================================================
+
+static const VkFormat format_mappings_[] = {
+    VK_FORMAT_UNDEFINED,
+    VK_FORMAT_B8G8R8A8_UNORM,
+    VK_FORMAT_B8G8R8A8_SRGB,
+    VK_FORMAT_D24_UNORM_S8_UINT,
+};
+
+static VkFormat cgvk_decode_format(cgvk_Format fmt)
+{
+    return format_mappings_[(size_t)fmt];
+}
+
+static const VkImageLayout image_layout_mappings_[] = {
+    VK_IMAGE_LAYOUT_UNDEFINED,
+    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+    VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+};
+
+static VkImageLayout cgvk_decode_image_layout(cgvk_ImageLayout l)
+{
+    return image_layout_mappings_[(size_t)l];
 }
 
 // ============================================================================
