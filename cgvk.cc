@@ -28,6 +28,28 @@
 #define CGVK_VERSION_MINOR 1
 #define CGVK_VERSION_PATCH 0
 
+#define CGVK_MAX_SWAPCHAIN_IMAGE_COUNT 16
+
+// ============================================================================
+
+enum cgvk_Format {
+    CGVK_FORMAT_UNDEFINED = 0,
+    CGVK_FORMAT_B8G8R8A8_UNORM = 1,
+    CGVK_FORMAT_B8G8R8A8_SRGB = 2,
+    CGVK_FORMAT_D24_UNORM_S8_SINT = 250,
+};
+
+enum cgvk_ImageLayout {
+    CGVK_IMAGE_LAYOUT_UNDEFINED = 0,
+    CGVK_IMAGE_LAYOUT_TRANSFER_SRC = 1,
+    CGVK_IMAGE_LAYOUT_TRANSFER_DST = 2,
+    CGVK_IMAGE_LAYOUT_SHADER_READ = 3,
+    CGVK_IMAGE_LAYOUT_COLOR_ATTACHMENT = 4,
+    CGVK_IMAGE_LAYOUT_DEPTH_ATTACHMENT = 5,
+    CGVK_IMAGE_LAYOUT_PRESENT_SRC = 6,
+    CGVK_IMAGE_LAYOUT_MAX = 0xF,
+};
+
 // ============================================================================
 
 struct cgvk_Device {
@@ -41,15 +63,287 @@ struct cgvk_Device {
     uint32_t present_queue_family;
 };
 
+struct cgvk_Image {
+    const cgvk_Device* dev;
+    VmaAllocation memory;
+    VkImage image;
+    VkImageView image_view;
+    uint8_t format; // cgvk_Format
+    uint8_t layout: 4; // cgvk_ImageLayout
+    uint8_t aspect_color: 1;
+    uint8_t aspect_depth: 1;
+    uint8_t aspect_stencil: 1;
+    uint8_t levels;
+    uint16_t width;
+    uint16_t height;
+    uint16_t depth;
+    uint16_t layers;
+};
+
+struct cgvk_Swapchain {
+    const cgvk_Device* dev;
+    VkSwapchainKHR swapchain;
+    uint8_t format; // cgvk_Format
+    uint8_t image_count;
+    uint16_t width;
+    uint16_t height;
+    cgvk_Image images[CGVK_MAX_SWAPCHAIN_IMAGE_COUNT];
+};
+
 // ============================================================================
 
 static cgvk_Device dev_;
+static cgvk_Swapchain swp_;
+
+// ============================================================================
+
+static void cgvk_kill_image(cgvk_Image* img)
+{
+    if (img->image_view)
+        vkDestroyImageView(img->dev->device, img->image_view, NULL);
+
+    if (img->memory)
+        vmaDestroyImage(img->dev->allocator, img->image, img->memory);
+
+    memset(img, 0, sizeof(cgvk_Image));
+}
 
 // ============================================================================
 
 static VkInstance cgvk_get_instance();
 static VkSurfaceKHR cgvk_get_surface();
 static void cgvk_get_drawable_extent(VkExtent2D* extent);
+
+// ============================================================================
+
+static VkPresentModeKHR cgvk_choose_present_mode(const cgvk_Device* dev, VkSurfaceKHR surface)
+{
+    VkResult result;
+    VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
+
+    uint32_t present_mode_count;
+    result = vkGetPhysicalDeviceSurfacePresentModesKHR(dev->gpu, surface, &present_mode_count, NULL);
+    if (result != VK_SUCCESS) {
+        log_fatal("vkGetPhysicalDeviceSurfacePresentModesKHR failed: %d", (int)result);
+        abort();
+    }
+
+    VkPresentModeKHR present_modes[present_mode_count];
+    result = vkGetPhysicalDeviceSurfacePresentModesKHR(dev->gpu, surface, &present_mode_count, present_modes);
+    if (result != VK_SUCCESS) {
+        log_fatal("vkGetPhysicalDeviceSurfacePresentModesKHR failed: %d", (int)result);
+        abort();
+    }
+
+    for (int i = 0, n = present_mode_count; i < n; ++i) {
+        if (present_modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) {
+            present_mode = VK_PRESENT_MODE_MAILBOX_KHR;
+            break;
+        }
+    }
+
+    return present_mode;
+}
+
+static void cgvk_choose_surface_format(
+    const cgvk_Device* dev,
+    VkSurfaceKHR surface,
+    cgvk_Format* found_fmt,
+    VkFormat* found_format,
+    VkColorSpaceKHR* found_colorspace)
+{
+    VkResult result;
+    cgvk_Format fmt = CGVK_FORMAT_UNDEFINED;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkColorSpaceKHR colorspace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+
+    uint32_t format_count;
+    result = vkGetPhysicalDeviceSurfaceFormatsKHR(dev->gpu, surface, &format_count, NULL);
+    if (result != VK_SUCCESS) {
+        log_fatal("vkGetPhysicalDeviceSurfaceFormatsKHR failed: %d", (int)result);
+        abort();
+    }
+    if (format_count == 0) {
+        log_fatal("The surface does not provide formats");
+        abort();
+    }
+    
+    VkSurfaceFormatKHR formats[format_count];
+    result = vkGetPhysicalDeviceSurfaceFormatsKHR(dev->gpu, surface, &format_count, formats);
+    if (result != VK_SUCCESS) {
+        log_fatal("vkGetPhysicalDeviceSurfaceFormatsKHR failed: %d", (int)result);
+        abort();
+    }
+
+    if (format_count == 1 && formats[0].format == VK_FORMAT_UNDEFINED) {
+        fmt = CGVK_FORMAT_B8G8R8A8_SRGB;
+        format = VK_FORMAT_B8G8R8A8_SRGB;
+    } else {
+        for (int i = 0, n = format_count; i < n; ++i) {
+            const VkSurfaceFormatKHR* f = &formats[i];
+            if (f->format == VK_FORMAT_B8G8R8A8_SRGB) {
+                fmt = CGVK_FORMAT_B8G8R8A8_SRGB;
+                format = f->format;
+                colorspace = f->colorSpace;
+                break;
+            }
+        }
+    }
+
+    if (format == VK_FORMAT_UNDEFINED) {
+        log_fatal("Cannot find valid surface format");
+        abort();
+    }
+
+    *found_fmt = fmt;
+    *found_format = format;
+    *found_colorspace = colorspace;
+}
+
+static void cgvk_init_swapchain(const cgvk_Device* dev, cgvk_Swapchain* swp)
+{
+    VkResult result;
+
+    memset(swp, 0, sizeof(cgvk_Swapchain));
+
+    VkSurfaceKHR surface = cgvk_get_surface();
+
+    // Query surface capabilites
+    VkSurfaceCapabilitiesKHR caps;
+    result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(dev->gpu, surface, &caps);
+    if (result != VK_SUCCESS) {
+        log_fatal("vkGetPhysicalDeviceSurfaceCapabilitiesKHR failed: %d", (int)result);
+        abort();
+    }
+
+    // Select image count
+    uint32_t image_count = 3;
+    if (image_count < caps.minImageCount)
+        image_count = caps.minImageCount;
+    if (caps.maxImageCount != 0 && image_count > caps.maxImageCount)
+        image_count = caps.maxImageCount;
+
+    // Select image extent
+    VkExtent2D extent = caps.currentExtent;
+    if (extent.width == UINT32_MAX || extent.height == UINT32_MAX)
+        cgvk_get_drawable_extent(&extent);
+
+    // Select present mode
+    VkPresentModeKHR present_mode = cgvk_choose_present_mode(dev, surface);
+    
+    // Select image format
+    cgvk_Format fmt;
+    VkFormat format;
+    VkColorSpaceKHR colorspace;
+    cgvk_choose_surface_format(dev, surface, &fmt, &format, &colorspace);
+
+    // create swapchain
+    VkSwapchainCreateInfoKHR create_info = {
+        .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+        .pNext = NULL,
+        .flags = 0,
+        .surface = surface,
+        .minImageCount = image_count,
+        .imageFormat = format,
+        .imageColorSpace = colorspace,
+        .imageExtent = extent,
+        .imageArrayLayers = 1,
+        .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = NULL,
+        .preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+        .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+        .presentMode = present_mode,
+        .clipped = VK_TRUE,
+        .oldSwapchain = VK_NULL_HANDLE,
+    };
+
+    VkSwapchainKHR swapchain;
+    result = vkCreateSwapchainKHR(dev->device, &create_info, NULL, &swapchain);
+    if (result != VK_SUCCESS) {
+        log_fatal("vkCreateSwapchainKHR failed: %d", (int)result);
+        abort();
+    }
+
+    result = vkGetSwapchainImagesKHR(dev->device, swapchain, &image_count, NULL);
+    if (result != VK_SUCCESS) {
+        log_fatal("vkGetSwapchainImagesKHR failed: %d", (int)result);
+        abort();
+    }
+
+    VkImage images[image_count];
+    result = vkGetSwapchainImagesKHR(dev->device, swapchain, &image_count, images);
+    if (result != VK_SUCCESS) {
+        log_fatal("vkGetSwapchainImagesKHR failed: %d", (int)result);
+        abort();
+    }
+
+    VkImageView image_views[image_count];
+    for (int i = 0, n = image_count; i < n; ++i) {
+        VkImageViewCreateInfo create_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .pNext = NULL,
+            .flags = 0,
+            .image = images[i],
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = format,
+            .components = {
+                .r = VK_COMPONENT_SWIZZLE_R,
+                .g = VK_COMPONENT_SWIZZLE_G,
+                .b = VK_COMPONENT_SWIZZLE_B,
+                .a = VK_COMPONENT_SWIZZLE_A,
+            },
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        };
+        result = vkCreateImageView(dev->device, &create_info, NULL, &image_views[i]);
+        if (result != VK_SUCCESS) {
+            log_fatal("vkCreateImageView failed: %d", (int)result);
+            abort();
+        }
+    }
+
+    swp->dev = dev;
+    swp->swapchain = swapchain;
+    swp->format = fmt;
+    swp->image_count = image_count;
+    swp->width = extent.width;
+    swp->height = extent.height;
+
+    for (int i = 0, n = image_count; i < n; ++i) {
+        cgvk_Image* img = &swp->images[i];
+        img->dev = dev;
+        img->image = images[i];
+        img->image_view = image_views[i];
+        img->format = (uint8_t)fmt;
+        img->width = extent.width;
+        img->height = extent.height;
+        img->depth = 1;
+        img->levels = 1;
+        img->layers = 1;
+        img->layout = CGVK_IMAGE_LAYOUT_UNDEFINED;
+        img->aspect_color = 1;
+    }
+}
+
+static void cgvk_kill_swapchain(cgvk_Swapchain* swp)
+{
+    for (int i = 0, n = swp->image_count; i < n; ++i) {
+        cgvk_kill_image(&swp->images[i]);
+    }
+
+    if (swp->swapchain) {
+        vkDestroySwapchainKHR(swp->dev->device, swp->swapchain, NULL);
+    }
+
+    memset(swp, 0, sizeof(cgvk_Swapchain));
+}
 
 // ============================================================================
 
@@ -81,29 +375,107 @@ static VkPhysicalDevice cgvk_choose_gpu()
     return gpus[0];
 }
 
+static void cgvk_choose_queue_families(
+    VkPhysicalDevice gpu,
+    VkSurfaceKHR surface,
+    uint32_t* found_main_queue_family,
+    uint32_t* found_present_queue_family)
+{
+    VkResult result;
+    uint32_t main_queue_family = UINT32_MAX;
+    uint32_t present_queue_family = UINT32_MAX;
+
+    uint32_t queue_family_count;
+    vkGetPhysicalDeviceQueueFamilyProperties(gpu, &queue_family_count, NULL);
+    
+    VkQueueFamilyProperties properties[queue_family_count];
+    vkGetPhysicalDeviceQueueFamilyProperties(gpu, &queue_family_count, properties);
+
+    VkBool32 supported[queue_family_count];
+    for (int i = 0, n = queue_family_count; i < n; ++i) {
+        result = vkGetPhysicalDeviceSurfaceSupportKHR(gpu, i, surface, &supported[i]);
+        if (result != VK_SUCCESS) {
+            log_fatal("vkGetPhysicalDeviceSurfaceSupportKHR failed: %d", (int)result);
+            abort();
+        }
+    }
+    for (uint32_t i = 0, n = queue_family_count; i < n; ++i) {
+        const VkQueueFamilyProperties* p = &properties[i];
+        if (p->queueCount == 0)
+            continue;
+        VkQueueFlags mask = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT;
+        if (main_queue_family == UINT32_MAX && (p->queueFlags & mask) == mask)
+            main_queue_family = i;
+        if (present_queue_family == UINT32_MAX && supported[i])
+            present_queue_family = i;
+    }
+
+    *found_main_queue_family = main_queue_family;
+    *found_present_queue_family = present_queue_family;
+}
+
+static void cgvk_init_allocator(cgvk_Device* dev)
+{
+    VmaVulkanFunctions functions = {
+        .vkGetPhysicalDeviceProperties = vkGetPhysicalDeviceProperties,
+        .vkGetPhysicalDeviceMemoryProperties = vkGetPhysicalDeviceMemoryProperties,
+        .vkAllocateMemory = vkAllocateMemory,
+        .vkFreeMemory = vkFreeMemory,
+        .vkMapMemory = vkMapMemory,
+        .vkUnmapMemory = vkUnmapMemory,
+        .vkFlushMappedMemoryRanges = vkFlushMappedMemoryRanges,
+        .vkInvalidateMappedMemoryRanges = vkInvalidateMappedMemoryRanges,
+        .vkBindBufferMemory = vkBindBufferMemory,
+        .vkBindImageMemory = vkBindImageMemory,
+        .vkGetBufferMemoryRequirements = vkGetBufferMemoryRequirements,
+        .vkGetImageMemoryRequirements = vkGetImageMemoryRequirements,
+        .vkCreateBuffer = vkCreateBuffer,
+        .vkDestroyBuffer = vkDestroyBuffer,
+        .vkCreateImage = vkCreateImage,
+        .vkDestroyImage = vkDestroyImage,
+        .vkCmdCopyBuffer = vkCmdCopyBuffer,
+        .vkGetBufferMemoryRequirements2KHR = vkGetBufferMemoryRequirements2,
+        .vkGetImageMemoryRequirements2KHR = vkGetImageMemoryRequirements2,
+        .vkBindBufferMemory2KHR = vkBindBufferMemory2,
+        .vkBindImageMemory2KHR = vkBindImageMemory2,
+        .vkGetPhysicalDeviceMemoryProperties2KHR = vkGetPhysicalDeviceMemoryProperties2,
+    };
+    VmaAllocatorCreateInfo create_info = {
+        .flags = 0,
+        .physicalDevice = dev->gpu,
+        .device = dev->device,
+        .preferredLargeHeapBlockSize = 0,
+        .pAllocationCallbacks = NULL,
+        .pDeviceMemoryCallbacks = NULL,
+        .frameInUseCount = 0,
+        .pHeapSizeLimit = NULL,
+        .pVulkanFunctions = &functions,
+        .pRecordSettings = NULL,
+        .instance = cgvk_get_instance(),
+        .vulkanApiVersion = VK_API_VERSION_1_1,
+    };
+    VkResult result = vmaCreateAllocator(&create_info, &dev->allocator);
+    if (result != VK_SUCCESS) {
+        log_fatal("vmaCreateAllocator failed: %d", (int)result);
+        abort();
+    }
+}
+
 static void cgvk_init_device(cgvk_Device* dev)
 {
     VkResult result;
 
-    VkInstance instance;
-    VkSurfaceKHR surface;
-    VkPhysicalDevice gpu;
-    VkDevice device;
+    VkSurfaceKHR surface = cgvk_get_surface();
 
     uint32_t extension_count = 0;
     const char* extension_names[4];
     VkPhysicalDeviceFeatures2 features, avail_features;
-    uint32_t main_queue_family = UINT32_MAX;
-    uint32_t present_queue_family = UINT32_MAX;
 
     memset(dev, 0, sizeof(cgvk_Device));
 
-    // Get globals
-    instance = cgvk_get_instance();
-    surface = cgvk_get_surface();
 
     // Choose GPU
-    gpu = cgvk_choose_gpu();
+    VkPhysicalDevice gpu = cgvk_choose_gpu();
     dev->gpu = gpu;
 
     // Choose features
@@ -128,7 +500,7 @@ static void cgvk_init_device(cgvk_Device* dev)
                 log_fatal("vkEnumerateDeviceExtensionProperties failed: %d", (int)result);
                 abort();
             }
-            for (uint32_t i = 0; i < available_extension_count; ++i) {
+            for (uint32_t i = 0, n = available_extension_count; i < n; ++i) {
                 const VkExtensionProperties* props = &properties[i];
                 const char* extname = props->extensionName;
                 if (strcmp(extname, VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0) {
@@ -140,30 +512,8 @@ static void cgvk_init_device(cgvk_Device* dev)
     }
 
     // select queues
-    {
-        uint32_t queue_family_count;
-        vkGetPhysicalDeviceQueueFamilyProperties(gpu, &queue_family_count, NULL);
-        VkQueueFamilyProperties properties[queue_family_count];
-        vkGetPhysicalDeviceQueueFamilyProperties(gpu, &queue_family_count, properties);
-        VkBool32 supported[queue_family_count];
-        for (uint32_t i = 0; i < queue_family_count; ++i) {
-            result = vkGetPhysicalDeviceSurfaceSupportKHR(gpu, i, surface, &supported[i]);
-            if (result != VK_SUCCESS) {
-                log_fatal("vkGetPhysicalDeviceSurfaceSupportKHR failed: %d", (int)result);
-                abort();
-            }
-        }
-        for (uint32_t i = 0; i < queue_family_count; ++i) {
-            const VkQueueFamilyProperties* p = &properties[i];
-            if (p->queueCount == 0)
-                continue;
-            VkQueueFlags mask = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT;
-            if (main_queue_family == UINT32_MAX && (p->queueFlags & mask) == mask)
-                main_queue_family = i;
-            if (present_queue_family == UINT32_MAX && supported[i])
-                present_queue_family = i;
-        }
-    }
+    uint32_t main_queue_family, present_queue_family;
+    cgvk_choose_queue_families(gpu, surface, &main_queue_family, &present_queue_family);
     dev->main_queue_family = main_queue_family;
     dev->present_queue_family = present_queue_family;
 
@@ -190,7 +540,7 @@ static void cgvk_init_device(cgvk_Device* dev)
     };
 
     // create device
-    VkDeviceCreateInfo device_create_info = {
+    VkDeviceCreateInfo create_info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = &features,
         .flags = 0,
@@ -202,7 +552,8 @@ static void cgvk_init_device(cgvk_Device* dev)
         .ppEnabledExtensionNames = extension_names,
         .pEnabledFeatures = NULL,
     };
-    result = vkCreateDevice(gpu, &device_create_info, NULL, &device);
+    VkDevice device;
+    result = vkCreateDevice(gpu, &create_info, NULL, &device);
     if (result != VK_SUCCESS) {
         log_fatal("vkCreateDevice failed: %d", (int)result);
         abort();
@@ -214,49 +565,7 @@ static void cgvk_init_device(cgvk_Device* dev)
     vkGetDeviceQueue(device, present_queue_family, 0, &dev->present_queue);
 
     // Init allocator
-    VmaVulkanFunctions alloc_functions = {
-        .vkGetPhysicalDeviceProperties = vkGetPhysicalDeviceProperties,
-        .vkGetPhysicalDeviceMemoryProperties = vkGetPhysicalDeviceMemoryProperties,
-        .vkAllocateMemory = vkAllocateMemory,
-        .vkFreeMemory = vkFreeMemory,
-        .vkMapMemory = vkMapMemory,
-        .vkUnmapMemory = vkUnmapMemory,
-        .vkFlushMappedMemoryRanges = vkFlushMappedMemoryRanges,
-        .vkInvalidateMappedMemoryRanges = vkInvalidateMappedMemoryRanges,
-        .vkBindBufferMemory = vkBindBufferMemory,
-        .vkBindImageMemory = vkBindImageMemory,
-        .vkGetBufferMemoryRequirements = vkGetBufferMemoryRequirements,
-        .vkGetImageMemoryRequirements = vkGetImageMemoryRequirements,
-        .vkCreateBuffer = vkCreateBuffer,
-        .vkDestroyBuffer = vkDestroyBuffer,
-        .vkCreateImage = vkCreateImage,
-        .vkDestroyImage = vkDestroyImage,
-        .vkCmdCopyBuffer = vkCmdCopyBuffer,
-        .vkGetBufferMemoryRequirements2KHR = vkGetBufferMemoryRequirements2,
-        .vkGetImageMemoryRequirements2KHR = vkGetImageMemoryRequirements2,
-        .vkBindBufferMemory2KHR = vkBindBufferMemory2,
-        .vkBindImageMemory2KHR = vkBindImageMemory2,
-        .vkGetPhysicalDeviceMemoryProperties2KHR = vkGetPhysicalDeviceMemoryProperties2,
-    };
-    VmaAllocatorCreateInfo alloc_create_info = {
-        .flags = 0,
-        .physicalDevice = gpu,
-        .device = device,
-        .preferredLargeHeapBlockSize = 0,
-        .pAllocationCallbacks = NULL,
-        .pDeviceMemoryCallbacks = NULL,
-        .frameInUseCount = 0,
-        .pHeapSizeLimit = NULL,
-        .pVulkanFunctions = &alloc_functions,
-        .pRecordSettings = NULL,
-        .instance = instance,
-        .vulkanApiVersion = VK_API_VERSION_1_1,
-    };
-    result = vmaCreateAllocator(&alloc_create_info, &dev->allocator);
-    if (result != VK_SUCCESS) {
-        log_fatal("vmaCreateAllocator failed: %d", (int)result);
-        abort();
-    }
+    cgvk_init_allocator(dev);
 }
 
 static void cgvk_kill_device(cgvk_Device* dev)
@@ -308,7 +617,7 @@ static void cgvk_init_instance(const char* appname, bool debug)
                 log_fatal("vkEnumerateInstanceLayerProperties failed: %d", (int)result);
                 abort();
             }
-            for (uint32_t i = 0; i < available_layer_count; ++i) {
+            for (uint32_t i = 0, n = available_layer_count; i < n; ++i) {
                 const VkLayerProperties* props = &properties[i];
                 if (strcmp(props->layerName, "VK_LAYER_KHRONOS_validation") == 0) {
                     layer_names[layer_count++] = "VK_LAYER_KHRONOS_validation";
@@ -336,7 +645,7 @@ static void cgvk_init_instance(const char* appname, bool debug)
                     log_fatal("vkEnumerateInstanceExtensionProperties failed: %d", (int)result);
                     abort();
                 }
-                for (uint32_t i = 0; i < available_extension_count; ++i) {
+                for (uint32_t i = 0, n = available_extension_count; i < n; ++i) {
                     const VkExtensionProperties* props = &properties[i];
                     if (strcmp(props->extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0) {
                         supports_EXT_debug_utils_ = true;
@@ -366,7 +675,7 @@ static void cgvk_init_instance(const char* appname, bool debug)
                 log_fatal("vkEnumerateInstanceExtensionProperties failed: %d", (int)result);
                 abort();
             }
-            for (uint32_t i = 0; i < available_extension_count; ++i) {
+            for (uint32_t i = 0, n = available_extension_count; i < n; ++i) {
                 const VkExtensionProperties* props = &properties[i];
                 const char* extname = props->extensionName;
                 if (strcmp(extname, VK_KHR_SURFACE_EXTENSION_NAME) == 0) {
@@ -523,10 +832,16 @@ CGVK_API void cgvk_init(const char* appname)
 
     // Init device
     cgvk_init_device(&dev_);
+
+    // Init swapchain
+    cgvk_init_swapchain(&dev_, &swp_);
 }
 
 CGVK_API void cgvk_quit()
 {
+    // Destroy swapchain
+    cgvk_kill_swapchain(&swp_);
+
     // Destroy device
     cgvk_kill_device(&dev_);
 
