@@ -29,6 +29,7 @@
 #define CGVK_VERSION_PATCH 0
 
 #define CGVK_MAX_SWAPCHAIN_IMAGE_COUNT 16
+#define CGVK_MAX_SEMAPHORE_POOL_CAPACITY 16
 
 // ============================================================================
 
@@ -91,6 +92,13 @@ struct cgvk_Swapchain {
     cgvk_Image images[CGVK_MAX_SWAPCHAIN_IMAGE_COUNT];
 };
 
+struct cgvk_SemaphorePool {
+    uint16_t total_count;
+    uint16_t used_count;
+    VkDevice device;
+    VkSemaphore semaphores[CGVK_MAX_SEMAPHORE_POOL_CAPACITY];
+};
+
 // ============================================================================
 
 static cgvk_Device dev_;
@@ -110,6 +118,51 @@ static void cgvk_kill_image(cgvk_Image* img)
         vmaDestroyImage(img->dev->allocator, img->image, img->memory);
 
     memset(img, 0, sizeof(cgvk_Image));
+}
+
+// ============================================================================
+
+static VkSemaphore cgvk_allocate_semaphore(cgvk_SemaphorePool* pool)
+{
+    if (pool->used_count < pool->total_count) {
+        return pool->semaphores[pool->used_count++];
+    } else {
+        assert(pool->used_count == pool->total_count);
+        VkSemaphoreCreateInfo create_info = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+            .pNext = NULL,
+            .flags = 0,
+        };
+        VkSemaphore semaphore;
+        VkResult result = vkCreateSemaphore(pool->device, &create_info, NULL, &semaphore);
+        if (result != VK_SUCCESS) {
+            log_fatal("vkCreateSemaphore failed: %d", (int)result);
+            abort();
+        }
+        pool->semaphores[pool->total_count++] = semaphore;
+        pool->used_count = pool->total_count;
+        return semaphore;
+    }
+}
+
+static void cgvk_reset_semaphore_pool(cgvk_SemaphorePool* pool)
+{
+    pool->used_count = 0;
+}
+
+static void cgvk_init_semaphore_pool(const cgvk_Device* dev, cgvk_SemaphorePool* pool)
+{
+    memset(pool, 0, sizeof(cgvk_SemaphorePool));
+    pool->device = dev->device;
+}
+
+static void cgvk_kill_semaphore_pool(cgvk_SemaphorePool* pool)
+{
+    for (int i = 0, n = pool->total_count; i < n; ++i) {
+        vkDestroySemaphore(pool->device, pool->semaphores[i], NULL);
+    }
+
+    memset(pool, 0, sizeof(cgvk_SemaphorePool));
 }
 
 // ============================================================================
