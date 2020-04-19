@@ -28,6 +28,7 @@
 #define CGVK_VERSION_MINOR 1
 #define CGVK_VERSION_PATCH 0
 
+#define CGVK_FRAME_LAG 3
 #define CGVK_MAX_SWAPCHAIN_IMAGE_COUNT 16
 #define CGVK_MAX_SEMAPHORE_POOL_CAPACITY 16
 
@@ -89,7 +90,7 @@ struct cgvk_Swapchain {
     uint8_t image_count;
     uint16_t width;
     uint16_t height;
-    cgvk_Image images[CGVK_MAX_SWAPCHAIN_IMAGE_COUNT];
+    cgvk_Image* images[CGVK_MAX_SWAPCHAIN_IMAGE_COUNT];
 };
 
 struct cgvk_SemaphorePool {
@@ -99,10 +100,20 @@ struct cgvk_SemaphorePool {
     VkSemaphore semaphores[CGVK_MAX_SEMAPHORE_POOL_CAPACITY];
 };
 
+struct cgvk_FrameList {
+    const cgvk_Device* dev;
+    const cgvk_Swapchain* swp;
+    uint64_t frame_counter;
+    uint8_t present_image_indices[CGVK_FRAME_LAG];
+    VkSemaphore acquire_next_image_semaphores[CGVK_FRAME_LAG];
+    cgvk_SemaphorePool semaphores[CGVK_FRAME_LAG];
+};
+
 // ============================================================================
 
 static cgvk_Device dev_;
 static cgvk_Swapchain swp_;
+static cgvk_FrameList fl_;
 
 static VkFormat cgvk_decode_format(cgvk_Format fmt);
 static VkImageLayout cgvk_decode_image_layout(cgvk_ImageLayout l);
@@ -128,6 +139,7 @@ static VkSemaphore cgvk_allocate_semaphore(cgvk_SemaphorePool* pool)
         return pool->semaphores[pool->used_count++];
     } else {
         assert(pool->used_count == pool->total_count);
+        assert(pool->total_count < CGVK_MAX_SEMAPHORE_POOL_CAPACITY);
         VkSemaphoreCreateInfo create_info = {
             .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
             .pNext = NULL,
@@ -163,6 +175,91 @@ static void cgvk_kill_semaphore_pool(cgvk_SemaphorePool* pool)
     }
 
     memset(pool, 0, sizeof(cgvk_SemaphorePool));
+}
+
+// ============================================================================
+
+static cgvk_SemaphorePool* cgvk_current_semaphore_pool(cgvk_FrameList* fl)
+{
+    size_t fidx = fl->frame_counter % CGVK_FRAME_LAG;
+    return &fl->semaphores[fidx];
+}
+
+static cgvk_Image* cgvk_current_present_image(cgvk_FrameList* fl)
+{
+    size_t fidx = fl->frame_counter % CGVK_FRAME_LAG;
+    return fl->swp->images[fl->present_image_indices[fidx]];
+}
+
+static void cgvk_begin_frame(cgvk_FrameList* fl)
+{
+    VkResult result;
+    size_t fidx = fl->frame_counter % CGVK_FRAME_LAG;
+
+    uint32_t image_index = -1;
+    VkSemaphore semaphore = cgvk_allocate_semaphore(&fl->semaphores[fidx]);
+    result = vkAcquireNextImageKHR(fl->dev->device, fl->swp->swapchain, UINT64_MAX, semaphore, VK_NULL_HANDLE, &image_index);
+    if (result != VK_SUCCESS) {
+        log_fatal("vkAcquireNextImageKHR failed: %d", (int)result);
+        abort();
+    }
+    fl->present_image_indices[fidx] = image_index;
+    fl->acquire_next_image_semaphores[fidx] = semaphore;
+}
+
+static void cgvk_end_frame(cgvk_FrameList* fl)
+{
+    VkResult result;
+    size_t fidx = fl->frame_counter % CGVK_FRAME_LAG;
+
+    VkSemaphore semaphore = fl->acquire_next_image_semaphores[fidx];
+    uint32_t image_index = fl->present_image_indices[fidx];
+    VkPresentInfoKHR present_info = {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+        .pNext = NULL,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &semaphore,
+        .swapchainCount = 1,
+        .pSwapchains = &fl->swp->swapchain,
+        .pImageIndices = &image_index,
+        .pResults = NULL,
+    };
+    result = vkQueuePresentKHR(fl->dev->present_queue, &present_info);
+    if (result != VK_SUCCESS) {
+        log_fatal("vkQueuePresentKHR failed: %d", (int)result);
+        abort();
+    }
+
+    // clear cached data
+    fl->acquire_next_image_semaphores[fidx] = VK_NULL_HANDLE;
+    fl->present_image_indices[fidx] = -1;
+
+    // ================ NEXT FRAME ==================
+
+    fl->frame_counter++;
+    fidx = fl->frame_counter % CGVK_FRAME_LAG;
+
+    // TODO: wait for fence
+    // TODO: reset command pools
+    cgvk_reset_semaphore_pool(&fl->semaphores[fidx]);
+}
+
+static void cgvk_init_frame_list(const cgvk_Device* dev, const cgvk_Swapchain* swp, cgvk_FrameList* fl)
+{
+    memset(fl, 0, sizeof(cgvk_FrameList));
+    fl->dev = dev;
+    fl->swp = swp;
+
+    for (int i = 0; i < CGVK_FRAME_LAG; ++i)
+        cgvk_init_semaphore_pool(dev, &fl->semaphores[i]);
+}
+
+static void cgvk_kill_frame_list(cgvk_FrameList* fl)
+{
+    for (int i = 0; i < CGVK_FRAME_LAG; ++i)
+        cgvk_kill_semaphore_pool(&fl->semaphores[i]);
+    
+    memset(fl, 0, sizeof(cgvk_FrameList));
 }
 
 // ============================================================================
@@ -411,7 +508,8 @@ static void cgvk_init_swapchain(const cgvk_Device* dev, cgvk_Swapchain* swp)
 
     // Init images
     for (int i = 0, n = image_count; i < n; ++i) {
-        cgvk_Image* img = &swp->images[i];
+        cgvk_Image* img = (cgvk_Image*)aligned_alloc(alignof(cgvk_Image), sizeof(cgvk_Image));
+        memset(img, 0, sizeof(cgvk_Image));
         img->dev = dev;
         img->image = images[i];
         img->image_view = image_views[i];
@@ -423,13 +521,15 @@ static void cgvk_init_swapchain(const cgvk_Device* dev, cgvk_Swapchain* swp)
         img->layers = 1;
         img->layout = CGVK_IMAGE_LAYOUT_UNDEFINED;
         img->aspect_color = 1;
+        swp->images[i] = img;
     }
 }
 
 static void cgvk_kill_swapchain(cgvk_Swapchain* swp)
 {
     for (int i = 0, n = swp->image_count; i < n; ++i) {
-        cgvk_kill_image(&swp->images[i]);
+        cgvk_kill_image(swp->images[i]);
+        free(swp->images[i]);
     }
 
     if (swp->swapchain) {
@@ -929,10 +1029,16 @@ CGVK_API void cgvk_init(const char* appname)
 
     // Init swapchain
     cgvk_init_swapchain(&dev_, &swp_);
+
+    // Init frame list
+    cgvk_init_frame_list(&dev_, &swp_, &fl_);
 }
 
 CGVK_API void cgvk_quit()
 {
+    // Destroy frame list
+    cgvk_kill_frame_list(&fl_);
+
     // Destroy swapchain
     cgvk_kill_swapchain(&swp_);
 
@@ -979,6 +1085,8 @@ CGVK_API bool cgvk_pump_events()
 
 CGVK_API void cgvk_render()
 {
+    cgvk_begin_frame(&fl_);
+    cgvk_end_frame(&fl_);
 }
 
 static VkInstance cgvk_get_instance()
