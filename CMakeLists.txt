@@ -19,6 +19,8 @@ PRIVATE
     "-g"
     "-Wall"
     "-fno-exceptions"
+    #"-Wpointer-sign"
+    #"-Wpedantic"
 )
 target_link_libraries(cgvk PUBLIC SDL2::SDL2)
 

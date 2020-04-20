@@ -32,11 +32,11 @@
 #define CGVK_FRAME_LAG 3
 #define CGVK_MAX_IMAGE_POOL_CAPACITY 1024
 #define CGVK_MAX_SWAPCHAIN_IMAGE_COUNT 16
-#define CGVK_MAX_SEMAPHORE_POOL_CAPACITY 16
+#define CGVK_MAX_SEMAPHORE_POOL_CAPACITY 64
 
 // ============================================================================
 
-enum cgvk_Format {
+enum cgvk_Format : uint8_t {
     CGVK_FORMAT_UNDEFINED = 0,
     CGVK_FORMAT_B8G8R8A8_UNORM = 1,
     CGVK_FORMAT_B8G8R8A8_SRGB = 2,
@@ -44,7 +44,7 @@ enum cgvk_Format {
     CGVK_FORMAT_MAX = 0xFF,
 };
 
-enum cgvk_ImageLayout {
+enum cgvk_ImageLayout : uint8_t {
     CGVK_IMAGE_LAYOUT_UNDEFINED = 0,
     CGVK_IMAGE_LAYOUT_TRANSFER_SRC = 1,
     CGVK_IMAGE_LAYOUT_TRANSFER_DST = 2,
@@ -53,6 +53,18 @@ enum cgvk_ImageLayout {
     CGVK_IMAGE_LAYOUT_DEPTH_ATTACHMENT = 5,
     CGVK_IMAGE_LAYOUT_PRESENT_SRC = 6,
     CGVK_IMAGE_LAYOUT_MAX = 0xF,
+};
+
+enum cgvk_SampleCount : uint8_t {
+    CGVK_SAMPLE_COUNT_1 = 0,
+    CGVK_SAMPLE_COUNT_2 = 1,
+    CGVK_SAMPLE_COUNT_4 = 2,
+    CGVK_SAMPLE_COUNT_8 = 3,
+    CGVK_SAMPLE_COUNT_16 = 4,
+    CGVK_SAMPLE_COUNT_32 = 5,
+    CGVK_SAMPLE_COUNT_64 = 6,
+    CGVK_SAMPLE_COUNT_128 = 7,
+    CGVK_SAMPLE_COUNT_MAX = 0x7,
 };
 
 // ============================================================================
@@ -76,10 +88,9 @@ struct cgvk_Image {
     VmaAllocation memory;
     VkImage image;
     VkImageView image_view;
+    cgvk_Format format;
     uint16_t id;
-    uint16_t format: 8; // cgvk_Format
-    uint16_t levels: 8;
-    uint16_t layout: 4; // cgvk_ImageLayout
+    uint16_t levels: 5;
     uint16_t aspect_color: 1;
     uint16_t aspect_depth: 1;
     uint16_t aspect_stencil: 1;
@@ -94,13 +105,13 @@ struct cgvk_ImagePool {
     uint16_t total_count;
     uint16_t free_count;
     uint16_t free_indices[CGVK_MAX_IMAGE_POOL_CAPACITY];
-    cgvk_Image images[CGVK_MAX_IMAGE_POOL_CAPACITY];
+    cgvk_Image objects[CGVK_MAX_IMAGE_POOL_CAPACITY];
 };
 
 struct cgvk_Swapchain {
     const cgvk_Device* dev;
     VkSwapchainKHR swapchain;
-    uint8_t format; // cgvk_Format
+    cgvk_Format format;
     uint8_t image_count;
     uint16_t width;
     uint16_t height;
@@ -120,23 +131,39 @@ struct cgvk_FrameList {
     uint64_t frame_counter;
     uint8_t present_image_indices[CGVK_FRAME_LAG];
     VkSemaphore acquire_next_image_semaphores[CGVK_FRAME_LAG];
+    VkSemaphore render_frame_semaphores[CGVK_FRAME_LAG];
     cgvk_SemaphorePool semaphores[CGVK_FRAME_LAG];
+    VkFence fences[CGVK_FRAME_LAG];
+    VkCommandPool main_command_pools[CGVK_FRAME_LAG];
+};
+
+struct cgvk_MainRenderPass {
+    const cgvk_Device* dev;
+    const cgvk_Swapchain* swp;
+    VkRenderPass render_pass;
+    VkFramebuffer framebuffers[CGVK_MAX_SWAPCHAIN_IMAGE_COUNT];
+    //cgvk_Image* depth_image;
+};
+
+struct cgvk_Renderer {
+    const cgvk_Device* dev;
+    const cgvk_Swapchain* swp;
+    cgvk_FrameList frames;
+    cgvk_ImagePool images;
+    cgvk_MainRenderPass rp;
 };
 
 // ============================================================================
-
-static cgvk_Device dev_;
-static cgvk_Swapchain swp_;
-static cgvk_FrameList fl_;
-static cgvk_ImagePool imgpool_;
 
 static VkFormat cgvk_decode_format(cgvk_Format fmt);
 static VkImageLayout cgvk_decode_image_layout(cgvk_ImageLayout l);
 
 // ============================================================================
 
-static void cgvk_release_image(cgvk_Image* img)
+static void cgvk_free_image(cgvk_Image* img)
 {
+    // TODO: free linked framebuffers
+
     if (img->image_view)
         vkDestroyImageView(img->dev->device, img->image_view, NULL);
 
@@ -144,7 +171,7 @@ static void cgvk_release_image(cgvk_Image* img)
         vmaDestroyImage(img->dev->allocator, img->image, img->memory);
 
     if (img->pool)
-        img->pool->free_indices[img->pool->free_count++] = img - img->pool->images;
+        img->pool->free_indices[img->pool->free_count++] = img - img->pool->objects;
 
     memset(img, 0, sizeof(cgvk_Image));
 }
@@ -156,11 +183,11 @@ static cgvk_Image* cgvk_allocate_image(cgvk_ImagePool* pool)
 
     if (pool->free_count > 0) {
         id = pool->free_indices[--pool->free_count];
-        img = &pool->images[id];
+        img = &pool->objects[id];
     } else {
         assert(pool->total_count < CGVK_MAX_IMAGE_POOL_CAPACITY);
         id = pool->total_count++;
-        img = &pool->images[id];
+        img = &pool->objects[id];
     }
 
     memset(img, 0, sizeof(cgvk_Image));
@@ -180,13 +207,135 @@ static void cgvk_init_image_pool(const cgvk_Device* dev, cgvk_ImagePool* pool)
 static void cgvk_kill_image_pool(cgvk_ImagePool* pool)
 {
     for (int i = 0, n = pool->total_count; i < n; ++i) {
-        if (!pool->images[i].pool)
+        if (!pool->objects[i].pool)
             continue;
-        pool->images[i].pool = NULL;
-        cgvk_release_image(&pool->images[i]);
+        pool->objects[i].pool = NULL;
+        cgvk_free_image(&pool->objects[i]);
     }
 
     memset(pool, 0, sizeof(cgvk_ImagePool));
+}
+
+// ============================================================================
+
+static void cgvk_init_main_render_pass(const cgvk_Device* dev, const cgvk_Swapchain* swp, const cgvk_ImagePool* imgpool, cgvk_MainRenderPass* rp)
+{
+    memset(rp, 0, sizeof(cgvk_MainRenderPass));
+    rp->dev = dev;
+    rp->swp = swp;
+
+    // render pass
+    {
+        VkFormat present_format = cgvk_decode_format(swp->format);
+
+        uint32_t attachment_count = 1;
+        VkAttachmentDescription attachments[1] = {
+            {
+                .flags = 0,
+                .format = present_format,
+                .samples = VK_SAMPLE_COUNT_1_BIT,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+                .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+                .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                .finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            },
+        };
+
+        uint32_t color_count = 1;
+        VkAttachmentReference color_refs[] = {
+            {
+                .attachment = 0,
+                .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            },
+        };
+
+        uint32_t subpass_count = 1;
+        VkSubpassDescription subpasses[1] = {
+            {
+                .flags = 0,
+                .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+                .inputAttachmentCount = 0,
+                .pInputAttachments = NULL,
+                .colorAttachmentCount = color_count,
+                .pColorAttachments = color_refs,
+                .pResolveAttachments = NULL,
+                .pDepthStencilAttachment = NULL,
+                .preserveAttachmentCount = 0,
+                .pPreserveAttachments = NULL,
+            },
+        };
+
+        uint32_t dependency_count = 1;
+        VkSubpassDependency dependencies[1] = {
+            {
+                .srcSubpass = VK_SUBPASS_EXTERNAL,
+                .dstSubpass = 0,
+                .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .srcAccessMask = 0,
+                .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                .dependencyFlags = 0,
+            },
+        };
+
+        VkRenderPassCreateInfo create_info = {
+            .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+            .pNext = NULL,
+            .flags = 0,
+            .attachmentCount = attachment_count,
+            .pAttachments = attachments,
+            .subpassCount = subpass_count,
+            .pSubpasses = subpasses,
+            .dependencyCount = dependency_count,
+            .pDependencies = dependencies,
+        };
+
+        VkResult result = vkCreateRenderPass(dev->device, &create_info, NULL, &rp->render_pass);
+        if (result != VK_SUCCESS) {
+            log_fatal("vkCreateRenderPass failed");
+            abort();
+        }
+    }
+
+    // framebuffers
+    for (int i = 0, n = swp->image_count; i < n; ++i) {
+        uint32_t attachment_count = 1;
+        VkImageView attachments[1] = {
+            swp->images[i]->image_view,
+        };
+
+        VkFramebufferCreateInfo create_info = {
+            .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+            .pNext = NULL,
+            .flags = 0,
+            .renderPass = rp->render_pass,
+            .attachmentCount = attachment_count,
+            .pAttachments = attachments,
+            .width = swp->width,
+            .height = swp->height,
+            .layers = 1,
+        };
+
+        VkResult result = vkCreateFramebuffer(dev->device, &create_info, NULL, &rp->framebuffers[i]);
+        if (result != VK_SUCCESS) {
+            log_fatal("vkCreateFramebuffer failed: %d", (int)result);
+            abort();
+        }
+    }
+}
+
+static void cgvk_kill_main_render_pass(cgvk_MainRenderPass* rp)
+{
+    for (int i = 0; i < CGVK_MAX_SWAPCHAIN_IMAGE_COUNT; ++i) {
+        if (rp->framebuffers[i])
+            vkDestroyFramebuffer(rp->dev->device, rp->framebuffers[i], NULL);
+    }
+
+    vkDestroyRenderPass(rp->dev->device, rp->render_pass, NULL);
+
+    memset(rp, 0, sizeof(cgvk_MainRenderPass));
 }
 
 // ============================================================================
@@ -237,26 +386,13 @@ static void cgvk_kill_semaphore_pool(cgvk_SemaphorePool* pool)
 
 // ============================================================================
 
-static cgvk_SemaphorePool* cgvk_current_semaphore_pool(cgvk_FrameList* fl)
-{
-    size_t fidx = fl->frame_counter % CGVK_FRAME_LAG;
-    return &fl->semaphores[fidx];
-}
-
-static cgvk_Image* cgvk_current_present_image(cgvk_FrameList* fl)
-{
-    size_t fidx = fl->frame_counter % CGVK_FRAME_LAG;
-    return fl->swp->images[fl->present_image_indices[fidx]];
-}
-
 static void cgvk_begin_frame(cgvk_FrameList* fl)
 {
-    VkResult result;
-    size_t fidx = fl->frame_counter % CGVK_FRAME_LAG;
+    const size_t fidx = fl->frame_counter % CGVK_FRAME_LAG;
 
     uint32_t image_index = -1;
     VkSemaphore semaphore = cgvk_allocate_semaphore(&fl->semaphores[fidx]);
-    result = vkAcquireNextImageKHR(fl->dev->device, fl->swp->swapchain, UINT64_MAX, semaphore, VK_NULL_HANDLE, &image_index);
+    VkResult result = vkAcquireNextImageKHR(fl->dev->device, fl->swp->swapchain, UINT64_MAX, semaphore, VK_NULL_HANDLE, &image_index);
     if (result != VK_SUCCESS) {
         log_fatal("vkAcquireNextImageKHR failed: %d", (int)result);
         abort();
@@ -265,31 +401,161 @@ static void cgvk_begin_frame(cgvk_FrameList* fl)
     fl->acquire_next_image_semaphores[fidx] = semaphore;
 }
 
+static void cgvk_render_frame(cgvk_Renderer* rnd)
+{
+    const size_t fidx = rnd->frames.frame_counter % CGVK_FRAME_LAG;
+
+    VkCommandBuffer main_cmdbuf;
+
+    // allocate main command buffer
+    {
+        VkCommandBufferAllocateInfo alloc_info = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .pNext = NULL,
+            .commandPool = rnd->frames.main_command_pools[fidx],
+            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1,
+        };
+
+        VkResult result = vkAllocateCommandBuffers(rnd->dev->device, &alloc_info, &main_cmdbuf);
+        if (result != VK_SUCCESS) {
+            log_fatal("vkAllocateCommandBuffers failed: %d", (int)result);
+            abort();
+        }
+    }
+
+    // begin recording main commands
+    {
+        VkCommandBufferBeginInfo begin_info = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .pNext = NULL,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            .pInheritanceInfo = NULL,
+        };
+
+        VkResult result = vkBeginCommandBuffer(main_cmdbuf, &begin_info);
+        if (result != VK_SUCCESS) {
+            log_fatal("vkBeginCommandBuffer failed: %d", (int)result);
+            abort();
+        }
+    }
+
+    // ======== Main Render Pass ========
+
+    uint32_t clear_value_count = 1;
+    VkClearValue clear_values[1] = {
+        {
+            .color = {
+                .float32 = { 0.0f, 0.0f, 0.0f, 0.0f },
+            },
+        }
+    };
+
+    VkRenderPassBeginInfo main_rp_begin = {
+        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+        .pNext = NULL,
+        .renderPass = rnd->rp.render_pass,
+        .framebuffer = rnd->rp.framebuffers[rnd->frames.present_image_indices[fidx]],
+        .renderArea = {
+            .offset = { 0, 0 },
+            .extent = { rnd->swp->width, rnd->swp->height },
+        },
+        .clearValueCount = clear_value_count,
+        .pClearValues = clear_values,
+    };
+
+    vkCmdBeginRenderPass(main_cmdbuf, &main_rp_begin, VK_SUBPASS_CONTENTS_INLINE);
+
+    vkCmdEndRenderPass(main_cmdbuf);
+
+    // ======== Finish Rendering ========
+
+    // end recording main commands
+    {
+        VkResult result = vkEndCommandBuffer(main_cmdbuf);
+        if (result != VK_SUCCESS) {
+            log_fatal("vkEndCommandBuffer failed: %d", (int)result);
+            abort();
+        }
+    }
+
+    // reset fence
+    {
+        VkResult result = vkResetFences(rnd->dev->device, 1, &rnd->frames.fences[fidx]);
+        if (result != VK_SUCCESS) {
+            log_fatal("vkResetFences failed: %d", (int)result);
+            abort();
+        }
+    }
+
+    // submit main command buffer
+    {
+        VkSemaphore semaphore = cgvk_allocate_semaphore(&rnd->frames.semaphores[fidx]);
+        rnd->frames.render_frame_semaphores[fidx] = semaphore;
+
+        uint32_t wait_semaphore_count = 1;
+        VkSemaphore wait_semaphores[1] = {
+            rnd->frames.acquire_next_image_semaphores[fidx],
+        };
+        VkPipelineStageFlags wait_dststages[1] = {
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        };
+
+        VkSubmitInfo submit_info = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .pNext = NULL,
+            .waitSemaphoreCount = wait_semaphore_count,
+            .pWaitSemaphores = wait_semaphores,
+            .pWaitDstStageMask = wait_dststages,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &main_cmdbuf,
+            .signalSemaphoreCount = 1,
+            .pSignalSemaphores = &semaphore,
+        };
+
+        VkResult result = vkQueueSubmit(rnd->dev->main_queue, 1, &submit_info, rnd->frames.fences[fidx]);
+        if (result != VK_SUCCESS) {
+            log_fatal("vkQueueSubmit failed: %d", (int)result);
+            abort();
+        }
+
+        
+    }
+}
+
 static void cgvk_end_frame(cgvk_FrameList* fl)
 {
-    VkResult result;
     size_t fidx = fl->frame_counter % CGVK_FRAME_LAG;
 
-    VkSemaphore semaphore = fl->acquire_next_image_semaphores[fidx];
-    uint32_t image_index = fl->present_image_indices[fidx];
-    VkPresentInfoKHR present_info = {
-        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-        .pNext = NULL,
-        .waitSemaphoreCount = 1,
-        .pWaitSemaphores = &semaphore,
-        .swapchainCount = 1,
-        .pSwapchains = &fl->swp->swapchain,
-        .pImageIndices = &image_index,
-        .pResults = NULL,
-    };
-    result = vkQueuePresentKHR(fl->dev->present_queue, &present_info);
-    if (result != VK_SUCCESS) {
-        log_fatal("vkQueuePresentKHR failed: %d", (int)result);
-        abort();
+    // Submit the final image to present
+    {
+        uint32_t wait_semaphore_count = 1;
+        VkSemaphore wait_semaphores[] = {
+            fl->render_frame_semaphores[fidx]
+        };
+        uint32_t image_index = fl->present_image_indices[fidx];
+
+        VkPresentInfoKHR present_info = {
+            .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+            .pNext = NULL,
+            .waitSemaphoreCount = wait_semaphore_count,
+            .pWaitSemaphores = wait_semaphores,
+            .swapchainCount = 1,
+            .pSwapchains = &fl->swp->swapchain,
+            .pImageIndices = &image_index,
+            .pResults = NULL,
+        };
+
+        VkResult result = vkQueuePresentKHR(fl->dev->present_queue, &present_info);
+        if (result != VK_SUCCESS) {
+            log_fatal("vkQueuePresentKHR failed: %d", (int)result);
+            abort();
+        }
     }
 
     // clear cached data
     fl->acquire_next_image_semaphores[fidx] = VK_NULL_HANDLE;
+    fl->render_frame_semaphores[fidx] = VK_NULL_HANDLE;
     fl->present_image_indices[fidx] = -1;
 
     // ================ NEXT FRAME ==================
@@ -298,9 +564,25 @@ static void cgvk_end_frame(cgvk_FrameList* fl)
     fl->frame_counter++;
     fidx = fl->frame_counter % CGVK_FRAME_LAG;
 
-    // TODO: wait for fence
-    // TODO: reset command pools
-    cgvk_reset_semaphore_pool(&fl->semaphores[fidx]);
+    // wait for the completion
+    {
+        VkResult result = vkWaitForFences(fl->dev->device, 1, &fl->fences[fidx], VK_TRUE, UINT64_MAX);
+        if (result != VK_SUCCESS) {
+            log_fatal("vkWaitForFences failed: %d", (int)result);
+            abort();
+        }
+    }
+
+    // reset the frame context
+    {
+        cgvk_reset_semaphore_pool(&fl->semaphores[fidx]);
+
+        VkResult result = vkResetCommandPool(fl->dev->device, fl->main_command_pools[fidx], 0);
+        if (result != VK_SUCCESS) {
+            log_fatal("vkResetCommandPool failed: %d", (int)result);
+            abort();
+        }
+    }
 }
 
 static void cgvk_init_frame_list(const cgvk_Device* dev, const cgvk_Swapchain* swp, cgvk_FrameList* fl)
@@ -311,13 +593,52 @@ static void cgvk_init_frame_list(const cgvk_Device* dev, const cgvk_Swapchain* s
 
     for (int i = 0; i < CGVK_FRAME_LAG; ++i)
         cgvk_init_semaphore_pool(dev, &fl->semaphores[i]);
+    
+    // fences
+    {
+        VkFenceCreateInfo create_info = {
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+        .pNext = NULL,
+        .flags = VK_FENCE_CREATE_SIGNALED_BIT,
+        };
+        for (int i = 0; i < CGVK_FRAME_LAG; ++i) {
+            VkResult result = vkCreateFence(dev->device, &create_info, NULL, &fl->fences[i]);
+            if (result != VK_SUCCESS) {
+                log_fatal("vkCreateFence failed: %d", (int)result);
+                abort();
+            }
+        }
+    }
+
+    // command pools
+    {
+        VkCommandPoolCreateInfo create_info = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .pNext = NULL,
+            .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+            .queueFamilyIndex = dev->main_queue_family,
+        };
+        for (int i = 0; i < CGVK_FRAME_LAG; ++i) {
+            VkResult result = vkCreateCommandPool(dev->device, &create_info, NULL, &fl->main_command_pools[i]);
+            if (result != VK_SUCCESS) {
+                log_fatal("vkCreateCommandPool failed: %d", (int)result);
+                abort();
+            }
+        }
+    }
 }
 
 static void cgvk_kill_frame_list(cgvk_FrameList* fl)
 {
     for (int i = 0; i < CGVK_FRAME_LAG; ++i)
         cgvk_kill_semaphore_pool(&fl->semaphores[i]);
-    
+
+    for (int i = 0; i < CGVK_FRAME_LAG; ++i)
+        vkDestroyFence(fl->dev->device, fl->fences[i], NULL);
+
+    for (int i = 0; i < CGVK_FRAME_LAG; ++i)
+        vkDestroyCommandPool(fl->dev->device, fl->main_command_pools[i], NULL);
+
     memset(fl, 0, sizeof(cgvk_FrameList));
 }
 
@@ -395,6 +716,7 @@ static void cgvk_choose_surface_format(
     VkColorSpaceKHR* found_colorspace)
 {
     VkResult result;
+
     cgvk_Format fmt = CGVK_FORMAT_UNDEFINED;
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkColorSpaceKHR colorspace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
@@ -570,13 +892,12 @@ static void cgvk_init_swapchain(const cgvk_Device* dev, cgvk_ImagePool* imgpool,
         cgvk_Image* img = cgvk_allocate_image(imgpool);
         img->image = images[i];
         img->image_view = image_views[i];
-        img->format = (uint8_t)fmt;
+        img->format = fmt;
         img->width = extent.width;
         img->height = extent.height;
         img->depth = 1;
         img->levels = 1;
         img->layers = 1;
-        img->layout = CGVK_IMAGE_LAYOUT_UNDEFINED;
         img->aspect_color = 1;
         swp->images[i] = img;
     }
@@ -585,7 +906,7 @@ static void cgvk_init_swapchain(const cgvk_Device* dev, cgvk_ImagePool* imgpool,
 static void cgvk_kill_swapchain(cgvk_Swapchain* swp)
 {
     for (int i = 0, n = swp->image_count; i < n; ++i) {
-        cgvk_release_image(swp->images[i]);
+        cgvk_free_image(swp->images[i]);
     }
 
     if (swp->swapchain) {
@@ -631,7 +952,6 @@ static void cgvk_choose_queue_families(
     uint32_t* found_main_queue_family,
     uint32_t* found_present_queue_family)
 {
-    VkResult result;
     uint32_t main_queue_family = UINT32_MAX;
     uint32_t present_queue_family = UINT32_MAX;
 
@@ -643,7 +963,7 @@ static void cgvk_choose_queue_families(
 
     VkBool32 supported[queue_family_count];
     for (int i = 0, n = queue_family_count; i < n; ++i) {
-        result = vkGetPhysicalDeviceSurfaceSupportKHR(gpu, i, surface, &supported[i]);
+        VkResult result = vkGetPhysicalDeviceSurfaceSupportKHR(gpu, i, surface, &supported[i]);
         if (result != VK_SUCCESS) {
             log_fatal("vkGetPhysicalDeviceSurfaceSupportKHR failed: %d", (int)result);
             abort();
@@ -713,8 +1033,6 @@ static void cgvk_init_allocator(cgvk_Device* dev)
 
 static void cgvk_init_device(cgvk_Device* dev)
 {
-    VkResult result;
-
     VkSurfaceKHR surface = cgvk_get_surface();
 
     uint32_t extension_count = 0;
@@ -722,7 +1040,6 @@ static void cgvk_init_device(cgvk_Device* dev)
     VkPhysicalDeviceFeatures2 features, avail_features;
 
     memset(dev, 0, sizeof(cgvk_Device));
-
 
     // Choose GPU
     VkPhysicalDevice gpu = cgvk_choose_gpu();
@@ -738,7 +1055,7 @@ static void cgvk_init_device(cgvk_Device* dev)
     // Check device extensions
     {
         uint32_t available_extension_count;
-        result = vkEnumerateDeviceExtensionProperties(gpu, NULL, &available_extension_count, NULL);
+        VkResult result = vkEnumerateDeviceExtensionProperties(gpu, NULL, &available_extension_count, NULL);
         if (result != VK_SUCCESS) {
             log_fatal("vkEnumerateDeviceExtensionProperties failed: %d", (int)result);
             abort();
@@ -803,7 +1120,7 @@ static void cgvk_init_device(cgvk_Device* dev)
         .pEnabledFeatures = NULL,
     };
     VkDevice device;
-    result = vkCreateDevice(gpu, &create_info, NULL, &device);
+    VkResult result = vkCreateDevice(gpu, &create_info, NULL, &device);
     if (result != VK_SUCCESS) {
         log_fatal("vkCreateDevice failed: %d", (int)result);
         abort();
@@ -1052,6 +1369,10 @@ static void cgvk_init_surface()
     }
 }
 
+static cgvk_Device dev_;
+static cgvk_Swapchain swp_;
+static cgvk_Renderer rnd_;
+
 CGVK_API void cgvk_init(const char* appname)
 {
     // Init SDL2
@@ -1080,31 +1401,31 @@ CGVK_API void cgvk_init(const char* appname)
     cgvk_init_window(appname);
     cgvk_init_surface();
 
-    // Init device
+    //
     cgvk_init_device(&dev_);
-
-    // Init image pool
-    cgvk_init_image_pool(&dev_, &imgpool_);
-
-    // Init swapchain
-    cgvk_init_swapchain(&dev_, &imgpool_, &swp_);
-
-    // Init frame list
-    cgvk_init_frame_list(&dev_, &swp_, &fl_);
+    cgvk_init_image_pool(&dev_, &rnd_.images);
+    cgvk_init_swapchain(&dev_, &rnd_.images, &swp_);
+    cgvk_init_main_render_pass(&dev_, &swp_, &rnd_.images, &rnd_.rp);
+    cgvk_init_frame_list(&dev_, &swp_, &rnd_.frames);
+    rnd_.dev = &dev_;
+    rnd_.swp = &swp_;
 }
 
 CGVK_API void cgvk_quit()
 {
-    // Destroy frame list
-    cgvk_kill_frame_list(&fl_);
+    {
+        VkResult result = vkDeviceWaitIdle(dev_.device);
+        if (result != VK_SUCCESS) {
+            log_fatal("vkDeviceWaitIdle failed: %d", (int)result);
+            abort();
+        }
+    }
 
-    // Destroy swapchain
+    //
+    cgvk_kill_frame_list(&rnd_.frames);
+    cgvk_kill_main_render_pass(&rnd_.rp);
     cgvk_kill_swapchain(&swp_);
-
-    // Destroy image pool
-    cgvk_kill_image_pool(&imgpool_);
-
-    // Destroy device
+    cgvk_kill_image_pool(&rnd_.images);
     cgvk_kill_device(&dev_);
 
     // Destroy surface and window
@@ -1147,8 +1468,9 @@ CGVK_API bool cgvk_pump_events()
 
 CGVK_API void cgvk_render()
 {
-    cgvk_begin_frame(&fl_);
-    cgvk_end_frame(&fl_);
+    cgvk_begin_frame(&rnd_.frames);
+    cgvk_render_frame(&rnd_);
+    cgvk_end_frame(&rnd_.frames);
 }
 
 static VkInstance cgvk_get_instance()
