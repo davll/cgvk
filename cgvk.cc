@@ -21,6 +21,7 @@
 #include "volk.h"
 #include "vk_mem_alloc.h"
 #include "log.h"
+#include "uthash.h"
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
 
@@ -29,6 +30,7 @@
 #define CGVK_VERSION_PATCH 0
 
 #define CGVK_FRAME_LAG 3
+#define CGVK_MAX_IMAGE_POOL_CAPACITY 1024
 #define CGVK_MAX_SWAPCHAIN_IMAGE_COUNT 16
 #define CGVK_MAX_SEMAPHORE_POOL_CAPACITY 16
 
@@ -55,6 +57,8 @@ enum cgvk_ImageLayout {
 
 // ============================================================================
 
+struct cgvk_ImagePool;
+
 struct cgvk_Device {
     VkPhysicalDevice gpu;
     VkDevice device;
@@ -68,19 +72,29 @@ struct cgvk_Device {
 
 struct cgvk_Image {
     const cgvk_Device* dev;
+    cgvk_ImagePool* pool;
     VmaAllocation memory;
     VkImage image;
     VkImageView image_view;
-    uint8_t format; // cgvk_Format
-    uint8_t layout: 4; // cgvk_ImageLayout
-    uint8_t aspect_color: 1;
-    uint8_t aspect_depth: 1;
-    uint8_t aspect_stencil: 1;
-    uint8_t levels;
+    uint16_t id;
+    uint16_t format: 8; // cgvk_Format
+    uint16_t levels: 8;
+    uint16_t layout: 4; // cgvk_ImageLayout
+    uint16_t aspect_color: 1;
+    uint16_t aspect_depth: 1;
+    uint16_t aspect_stencil: 1;
     uint16_t width;
     uint16_t height;
     uint16_t depth;
     uint16_t layers;
+};
+
+struct cgvk_ImagePool {
+    const cgvk_Device* dev;
+    uint16_t total_count;
+    uint16_t free_count;
+    uint16_t free_indices[CGVK_MAX_IMAGE_POOL_CAPACITY];
+    cgvk_Image images[CGVK_MAX_IMAGE_POOL_CAPACITY];
 };
 
 struct cgvk_Swapchain {
@@ -114,13 +128,14 @@ struct cgvk_FrameList {
 static cgvk_Device dev_;
 static cgvk_Swapchain swp_;
 static cgvk_FrameList fl_;
+static cgvk_ImagePool imgpool_;
 
 static VkFormat cgvk_decode_format(cgvk_Format fmt);
 static VkImageLayout cgvk_decode_image_layout(cgvk_ImageLayout l);
 
 // ============================================================================
 
-static void cgvk_kill_image(cgvk_Image* img)
+static void cgvk_release_image(cgvk_Image* img)
 {
     if (img->image_view)
         vkDestroyImageView(img->dev->device, img->image_view, NULL);
@@ -128,7 +143,50 @@ static void cgvk_kill_image(cgvk_Image* img)
     if (img->memory)
         vmaDestroyImage(img->dev->allocator, img->image, img->memory);
 
+    if (img->pool)
+        img->pool->free_indices[img->pool->free_count++] = img - img->pool->images;
+
     memset(img, 0, sizeof(cgvk_Image));
+}
+
+static cgvk_Image* cgvk_allocate_image(cgvk_ImagePool* pool)
+{
+    cgvk_Image* img = NULL;
+    size_t id = SIZE_MAX;
+
+    if (pool->free_count > 0) {
+        id = pool->free_indices[--pool->free_count];
+        img = &pool->images[id];
+    } else {
+        assert(pool->total_count < CGVK_MAX_IMAGE_POOL_CAPACITY);
+        id = pool->total_count++;
+        img = &pool->images[id];
+    }
+
+    memset(img, 0, sizeof(cgvk_Image));
+    img->dev = pool->dev;
+    img->pool = pool;
+    img->id = id;
+
+    return img;
+}
+
+static void cgvk_init_image_pool(const cgvk_Device* dev, cgvk_ImagePool* pool)
+{
+    memset(pool, 0, sizeof(cgvk_ImagePool));
+    pool->dev = dev;
+}
+
+static void cgvk_kill_image_pool(cgvk_ImagePool* pool)
+{
+    for (int i = 0, n = pool->total_count; i < n; ++i) {
+        if (!pool->images[i].pool)
+            continue;
+        pool->images[i].pool = NULL;
+        cgvk_release_image(&pool->images[i]);
+    }
+
+    memset(pool, 0, sizeof(cgvk_ImagePool));
 }
 
 // ============================================================================
@@ -236,6 +294,7 @@ static void cgvk_end_frame(cgvk_FrameList* fl)
 
     // ================ NEXT FRAME ==================
 
+    assert(fl->frame_counter < UINT64_MAX);
     fl->frame_counter++;
     fidx = fl->frame_counter % CGVK_FRAME_LAG;
 
@@ -383,7 +442,7 @@ static void cgvk_choose_surface_format(
     *found_colorspace = colorspace;
 }
 
-static void cgvk_init_swapchain(const cgvk_Device* dev, cgvk_Swapchain* swp)
+static void cgvk_init_swapchain(const cgvk_Device* dev, cgvk_ImagePool* imgpool, cgvk_Swapchain* swp)
 {
     VkResult result;
 
@@ -508,9 +567,7 @@ static void cgvk_init_swapchain(const cgvk_Device* dev, cgvk_Swapchain* swp)
 
     // Init images
     for (int i = 0, n = image_count; i < n; ++i) {
-        cgvk_Image* img = (cgvk_Image*)aligned_alloc(alignof(cgvk_Image), sizeof(cgvk_Image));
-        memset(img, 0, sizeof(cgvk_Image));
-        img->dev = dev;
+        cgvk_Image* img = cgvk_allocate_image(imgpool);
         img->image = images[i];
         img->image_view = image_views[i];
         img->format = (uint8_t)fmt;
@@ -528,8 +585,7 @@ static void cgvk_init_swapchain(const cgvk_Device* dev, cgvk_Swapchain* swp)
 static void cgvk_kill_swapchain(cgvk_Swapchain* swp)
 {
     for (int i = 0, n = swp->image_count; i < n; ++i) {
-        cgvk_kill_image(swp->images[i]);
-        free(swp->images[i]);
+        cgvk_release_image(swp->images[i]);
     }
 
     if (swp->swapchain) {
@@ -1027,8 +1083,11 @@ CGVK_API void cgvk_init(const char* appname)
     // Init device
     cgvk_init_device(&dev_);
 
+    // Init image pool
+    cgvk_init_image_pool(&dev_, &imgpool_);
+
     // Init swapchain
-    cgvk_init_swapchain(&dev_, &swp_);
+    cgvk_init_swapchain(&dev_, &imgpool_, &swp_);
 
     // Init frame list
     cgvk_init_frame_list(&dev_, &swp_, &fl_);
@@ -1041,6 +1100,9 @@ CGVK_API void cgvk_quit()
 
     // Destroy swapchain
     cgvk_kill_swapchain(&swp_);
+
+    // Destroy image pool
+    cgvk_kill_image_pool(&imgpool_);
 
     // Destroy device
     cgvk_kill_device(&dev_);
