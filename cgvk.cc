@@ -22,6 +22,7 @@
 #include "vk_mem_alloc.h"
 #include "log.h"
 #include "uthash.h"
+#include "xxhash.h"
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
 
@@ -33,6 +34,7 @@
 #define CGVK_MAX_IMAGE_POOL_CAPACITY 1024
 #define CGVK_MAX_SWAPCHAIN_IMAGE_COUNT 16
 #define CGVK_MAX_SEMAPHORE_POOL_CAPACITY 64
+#define CGVK_MAX_SHADER_CACHE_CAPACITY 1024
 
 // ============================================================================
 
@@ -137,12 +139,30 @@ struct cgvk_FrameList {
     VkCommandPool main_command_pools[CGVK_FRAME_LAG];
 };
 
+struct cgvk_Shader {
+    XXH64_hash_t key;
+    VkShaderModule module;
+    struct cgvk_Shader* next;
+    struct cgvk_Shader* prev;
+    UT_hash_handle hh;
+};
+
+struct cgvk_ShaderCache {
+    const cgvk_Device* dev;
+    cgvk_Shader* head;
+    cgvk_Shader* oldest;
+    cgvk_Shader* newest;
+    uint16_t total_count;
+    cgvk_Shader objects[CGVK_MAX_SHADER_CACHE_CAPACITY];
+};
+
 struct cgvk_MainRenderPass {
     const cgvk_Device* dev;
     const cgvk_Swapchain* swp;
     VkRenderPass render_pass;
     VkFramebuffer framebuffers[CGVK_MAX_SWAPCHAIN_IMAGE_COUNT];
-    //cgvk_Image* depth_image;
+    VkPipelineLayout empty_pipeline_layout;
+    VkPipeline hello_triangle_pipeline;
 };
 
 struct cgvk_Renderer {
@@ -214,6 +234,109 @@ static void cgvk_kill_image_pool(cgvk_ImagePool* pool)
     }
 
     memset(pool, 0, sizeof(cgvk_ImagePool));
+}
+
+// ============================================================================
+
+static void cgvk_touch_shader(cgvk_ShaderCache* cache, cgvk_Shader* sh)
+{
+    if (sh == cache->newest)
+        return;
+    
+    assert(cache->oldest);
+    assert(cache->newest);
+    assert(cache->oldest != cache->newest);
+
+    if (sh->prev) {
+        sh->prev->next = sh->next;
+        sh->next->prev = sh->prev;
+    } else {
+        assert(sh == cache->oldest);
+        cache->oldest = cache->oldest->next;
+        cache->oldest->prev = NULL;
+    }
+
+    sh->next = NULL;
+    sh->prev = cache->newest;
+    cache->newest->next = sh;
+    cache->newest = sh;
+}
+
+static cgvk_Shader* cgvk_get_shader(cgvk_ShaderCache* cache, size_t size, const void* code)
+{
+    XXH64_hash_t key = XXH64(code, size, 0);
+    cgvk_Shader* sh = NULL;
+    HASH_FIND(hh, cache->head, &key, sizeof(XXH64_hash_t), sh);
+
+    if (sh) {
+        cgvk_touch_shader(cache, sh);
+    } else {
+        if (cache->total_count < CGVK_MAX_SHADER_CACHE_CAPACITY) {
+            sh = &cache->objects[cache->total_count++];
+        } else { // purge oldest
+            assert(cache->oldest);
+            assert(cache->oldest != cache->newest);
+            assert(cache->oldest->next);
+            sh = cache->oldest;
+            cache->oldest = cache->oldest->next;
+            cache->oldest->prev = NULL;
+            vkDestroyShaderModule(cache->dev->device, sh->module, NULL);
+        }
+        
+        memset(sh, 0, sizeof(cgvk_Shader));
+        memcpy(&sh->key, &key, sizeof(XXH64_hash_t));
+        HASH_ADD(hh, cache->head, key, sizeof(XXH64_hash_t), sh);
+        sh->prev = cache->newest;
+        if (cache->newest)
+            cache->newest->next = sh;
+        else
+            cache->oldest = sh;
+        cache->newest = sh;
+
+        VkShaderModuleCreateInfo create_info = {
+            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .pNext = NULL,
+            .flags = 0,
+            .codeSize = size,
+            .pCode = (const uint32_t*)code,
+        };
+
+        VkResult result = vkCreateShaderModule(cache->dev->device, &create_info, NULL, &sh->module);
+        if (result != VK_SUCCESS) {
+            log_fatal("vkCreateShaderModule failed: %d", (int)result);
+            abort();
+        }
+    }
+
+    return sh;
+}
+
+static cgvk_Shader* cgvk_get_shader(cgvk_ShaderCache* cache, XXH64_hash_t key)
+{
+    cgvk_Shader* sh = NULL;
+    HASH_FIND(hh, cache->head, &key, sizeof(XXH64_hash_t), sh);
+    if (sh) {
+        cgvk_touch_shader(cache, sh);
+    } else {
+        log_error("cannot find the shader of the hash: %llx", key);
+    }
+    return sh;
+}
+
+static void cgvk_init_shader_cache(const cgvk_Device* dev, cgvk_ShaderCache* cache)
+{
+    memset(cache, 0, sizeof(cgvk_ShaderCache));
+    cache->dev = dev;
+}
+
+static void cgvk_kill_shader_cache(cgvk_ShaderCache* cache)
+{
+    for (int i = 0, n = cache->total_count; i < n; ++i) {
+        if (cache->objects[i].module)
+            vkDestroyShaderModule(cache->dev->device, cache->objects[i].module, NULL);
+    }
+
+    memset(cache, 0, sizeof(cgvk_ShaderCache));
 }
 
 // ============================================================================
@@ -299,6 +422,175 @@ static void cgvk_init_main_render_pass(const cgvk_Device* dev, const cgvk_Swapch
         }
     }
 
+    // pipeline layout
+    {
+        VkPipelineLayoutCreateInfo create_info = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .pNext = NULL,
+            .flags = 0,
+            .setLayoutCount = 0,
+            .pSetLayouts = NULL,
+            .pushConstantRangeCount = 0,
+            .pPushConstantRanges = NULL,
+        };
+
+        VkResult result = vkCreatePipelineLayout(dev->device, &create_info, NULL, &rp->empty_pipeline_layout);
+        if (result != VK_SUCCESS) {
+            log_fatal("vkCreatePipelineLayout failed: %d", (int)result);
+            abort();
+        }
+    }
+
+    // pipeline
+    {
+        static const uint32_t vert_code[] = {
+            #include "triangle.vert.inc"
+        };
+        static const uint32_t frag_code[] = {
+            #include "triangle.frag.inc"
+        };
+
+        cgvk_ShaderCache cache;
+        cgvk_init_shader_cache(rp->dev, &cache);
+
+        auto vs = cgvk_get_shader(&cache, sizeof(vert_code), vert_code);
+        auto fs = cgvk_get_shader(&cache, sizeof(frag_code), frag_code);
+
+        VkPipelineShaderStageCreateInfo stages[2] = {
+            {
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .pNext = NULL,
+                .flags = 0,
+                .stage = VK_SHADER_STAGE_VERTEX_BIT,
+                .module = vs->module,
+                .pName = "main",
+                .pSpecializationInfo = NULL,
+            },
+            {
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .pNext = NULL,
+                .flags = 0,
+                .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+                .module = fs->module,
+                .pName = "main",
+                .pSpecializationInfo = NULL,
+            },
+        };
+
+        VkPipelineVertexInputStateCreateInfo vi = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+            .pNext = NULL,
+            .vertexBindingDescriptionCount = 0,
+            .pVertexBindingDescriptions = NULL,
+            .vertexAttributeDescriptionCount = 0,
+            .pVertexAttributeDescriptions = NULL,
+        };
+
+        VkPipelineInputAssemblyStateCreateInfo ia = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+            .pNext = NULL,
+            .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+            .primitiveRestartEnable = VK_FALSE,
+        };
+
+        VkPipelineViewportStateCreateInfo vps = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+            .pNext = NULL,
+            .viewportCount = 1,
+            .pViewports = NULL,
+            .scissorCount = 1,
+            .pScissors = NULL,
+        };
+
+        VkPipelineRasterizationStateCreateInfo rs = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+            .pNext = NULL,
+            .depthClampEnable = VK_FALSE,
+            .rasterizerDiscardEnable = VK_FALSE,
+            .polygonMode = VK_POLYGON_MODE_FILL,
+            .cullMode = VK_CULL_MODE_BACK_BIT,
+            .frontFace = VK_FRONT_FACE_CLOCKWISE,
+            .depthBiasEnable = VK_FALSE,
+            .lineWidth = 1.0f,
+        };
+
+        VkPipelineMultisampleStateCreateInfo ms = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+            .pNext = NULL,
+            .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+            .sampleShadingEnable = VK_FALSE,
+            .pSampleMask = NULL,
+            .alphaToCoverageEnable = VK_FALSE,
+            .alphaToOneEnable = VK_FALSE,
+        };
+
+        VkPipelineDepthStencilStateCreateInfo dss = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+            .pNext = NULL,
+            .depthTestEnable = VK_FALSE,
+            .depthWriteEnable = VK_FALSE,
+            .depthBoundsTestEnable = VK_FALSE,
+            .stencilTestEnable = VK_FALSE,
+        };
+
+        VkPipelineColorBlendAttachmentState bas[] = {
+            {
+                .blendEnable = VK_FALSE,
+                .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+            },
+        };
+
+        VkPipelineColorBlendStateCreateInfo bs = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+            .pNext = NULL,
+            .logicOpEnable = VK_FALSE,
+            .attachmentCount = 1,
+            .pAttachments = bas,
+        };
+
+        VkDynamicState dyss[] = {
+            VK_DYNAMIC_STATE_VIEWPORT,
+            VK_DYNAMIC_STATE_SCISSOR,
+        };
+
+        VkPipelineDynamicStateCreateInfo dys = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+            .pNext = NULL,
+            .dynamicStateCount = 2,
+            .pDynamicStates = dyss,
+        };
+
+        VkGraphicsPipelineCreateInfo create_info = {
+            .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+            .pNext = NULL,
+            .flags = 0,
+            .stageCount = 2,
+            .pStages = stages,
+            .pVertexInputState = &vi,
+            .pInputAssemblyState = &ia,
+            .pTessellationState = NULL,
+            .pViewportState = &vps,
+            .pRasterizationState = &rs,
+            .pMultisampleState = &ms,
+            .pDepthStencilState = &dss,
+            .pColorBlendState = &bs,
+            .pDynamicState = &dys,
+            .layout = rp->empty_pipeline_layout,
+            .renderPass = rp->render_pass,
+            .subpass = 0,
+            .basePipelineHandle = VK_NULL_HANDLE,
+            .basePipelineIndex = 0,
+        };
+
+        VkResult result = vkCreateGraphicsPipelines(rp->dev->device, VK_NULL_HANDLE, 1, &create_info, NULL, &rp->hello_triangle_pipeline);
+        if (result != VK_SUCCESS) {
+            log_fatal("vkCreateGraphicsPipelines failed: %d", (int)result);
+            abort();
+        }
+
+        cgvk_kill_shader_cache(&cache);
+    }
+
     // framebuffers
     for (int i = 0, n = swp->image_count; i < n; ++i) {
         uint32_t attachment_count = 1;
@@ -333,7 +625,14 @@ static void cgvk_kill_main_render_pass(cgvk_MainRenderPass* rp)
             vkDestroyFramebuffer(rp->dev->device, rp->framebuffers[i], NULL);
     }
 
-    vkDestroyRenderPass(rp->dev->device, rp->render_pass, NULL);
+    if (rp->hello_triangle_pipeline)
+        vkDestroyPipeline(rp->dev->device, rp->hello_triangle_pipeline, NULL);
+
+    if (rp->empty_pipeline_layout)
+        vkDestroyPipelineLayout(rp->dev->device, rp->empty_pipeline_layout, NULL);
+
+    if (rp->render_pass)
+        vkDestroyRenderPass(rp->dev->device, rp->render_pass, NULL);
 
     memset(rp, 0, sizeof(cgvk_MainRenderPass));
 }
@@ -465,6 +764,30 @@ static void cgvk_render_frame(cgvk_Renderer* rnd)
     };
 
     vkCmdBeginRenderPass(main_cmdbuf, &main_rp_begin, VK_SUBPASS_CONTENTS_INLINE);
+
+    {
+        VkViewport viewports[] = {
+            {
+                .x = 0.0f,
+                .y = 0.0f,
+                .width = (float)rnd->swp->width,
+                .height = (float)rnd->swp->height,
+                .minDepth = 0.0f,
+                .maxDepth = 1.0f,
+            },
+        };
+        VkRect2D scissors[] = {
+            {
+                .offset = { 0, 0 },
+                .extent = { rnd->swp->width, rnd->swp->height },
+            },
+        };
+
+        vkCmdBindPipeline(main_cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, rnd->rp.hello_triangle_pipeline);
+        vkCmdSetViewport(main_cmdbuf, 0, 1, viewports);
+        vkCmdSetScissor(main_cmdbuf, 0, 1, scissors);
+        vkCmdDraw(main_cmdbuf, 3, 1, 0, 0);
+    }
 
     vkCmdEndRenderPass(main_cmdbuf);
 
