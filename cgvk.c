@@ -1,16 +1,4 @@
-// Roadmap
-// 1) Hello world
-// 2) Forward lighting
-// 3) Remove global variables
-// 4) Custom shading
-// 5) Frame graph
-// ?) cgvk.cc -> ccvk.c
-//
-// Coding Guidelines
-// 1) Orthodox C++ (https://gist.github.com/bkaradzic/2e39896bc7d8c34e042b)
-// 2) Avoid C++ standard library
-// 3) No OOP
-// 4) No templates
+// CGVK Implementation
 
 // ============================================================================
 
