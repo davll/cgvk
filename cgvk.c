@@ -1523,7 +1523,7 @@ static void cgvk_init_instance(const char* appname, bool debug)
                 log_fatal("vkEnumerateInstanceLayerProperties failed: %d", (int)result);
                 abort();
             }
-            for (uint32_t i = 0, n = available_layer_count; i < n; ++i) {
+            for (unsigned i = 0, n = available_layer_count; i < n; ++i) {
                 const VkLayerProperties* props = &properties[i];
                 if (strcmp(props->layerName, "VK_LAYER_KHRONOS_validation") == 0) {
                     layer_names[layer_count++] = "VK_LAYER_KHRONOS_validation";
@@ -1551,7 +1551,7 @@ static void cgvk_init_instance(const char* appname, bool debug)
                     log_fatal("vkEnumerateInstanceExtensionProperties failed: %d", (int)result);
                     abort();
                 }
-                for (uint32_t i = 0, n = available_extension_count; i < n; ++i) {
+                for (unsigned i = 0, n = available_extension_count; i < n; ++i) {
                     const VkExtensionProperties* props = &properties[i];
                     if (strcmp(props->extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0) {
                         supports_EXT_debug_utils_ = true;
@@ -1581,7 +1581,7 @@ static void cgvk_init_instance(const char* appname, bool debug)
                 log_fatal("vkEnumerateInstanceExtensionProperties failed: %d", (int)result);
                 abort();
             }
-            for (uint32_t i = 0, n = available_extension_count; i < n; ++i) {
+            for (unsigned i = 0, n = available_extension_count; i < n; ++i) {
                 const VkExtensionProperties* props = &properties[i];
                 const char* extname = props->extensionName;
                 if (strcmp(extname, VK_KHR_SURFACE_EXTENSION_NAME) == 0) {
