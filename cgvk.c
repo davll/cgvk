@@ -38,15 +38,16 @@
 
 // ============================================================================
 
-enum cgvk_Format : uint8_t {
+typedef enum cgvk_Format {
     CGVK_FORMAT_UNDEFINED = 0,
     CGVK_FORMAT_B8G8R8A8_UNORM = 1,
     CGVK_FORMAT_B8G8R8A8_SRGB = 2,
     CGVK_FORMAT_D24_UNORM_S8_UINT = 3,
     CGVK_FORMAT_MAX = 0xFF,
-};
+} cgvk_Format;
+typedef uint8_t cgvk_PackedFormat;
 
-enum cgvk_ImageLayout : uint8_t {
+typedef enum cgvk_ImageLayout {
     CGVK_IMAGE_LAYOUT_UNDEFINED = 0,
     CGVK_IMAGE_LAYOUT_TRANSFER_SRC = 1,
     CGVK_IMAGE_LAYOUT_TRANSFER_DST = 2,
@@ -55,9 +56,10 @@ enum cgvk_ImageLayout : uint8_t {
     CGVK_IMAGE_LAYOUT_DEPTH_ATTACHMENT = 5,
     CGVK_IMAGE_LAYOUT_PRESENT_SRC = 6,
     CGVK_IMAGE_LAYOUT_MAX = 0xF,
-};
+} cgvk_ImageLayout;
+typedef uint8_t cgvk_PackedImageLayout;
 
-enum cgvk_SampleCount : uint8_t {
+typedef enum cgvk_SampleCount {
     CGVK_SAMPLE_COUNT_1 = 0,
     CGVK_SAMPLE_COUNT_2 = 1,
     CGVK_SAMPLE_COUNT_4 = 2,
@@ -67,13 +69,12 @@ enum cgvk_SampleCount : uint8_t {
     CGVK_SAMPLE_COUNT_64 = 6,
     CGVK_SAMPLE_COUNT_128 = 7,
     CGVK_SAMPLE_COUNT_MAX = 0x7,
-};
+} cgvk_SampleCount;
+typedef uint8_t cgvk_PackedSampleCount;
 
 // ============================================================================
 
-struct cgvk_ImagePool;
-
-struct cgvk_Device {
+typedef struct cgvk_Device {
     VkPhysicalDevice gpu;
     VkDevice device;
     VmaAllocator allocator;
@@ -82,11 +83,11 @@ struct cgvk_Device {
     bool supports_KHR_swapchain;
     uint32_t main_queue_family;
     uint32_t present_queue_family;
-};
+} cgvk_Device;
 
-struct cgvk_Image {
+typedef struct cgvk_Image {
     const cgvk_Device* dev;
-    cgvk_ImagePool* pool;
+    struct cgvk_ImagePool* pool;
     VmaAllocation memory;
     VkImage image;
     VkImageView image_view;
@@ -100,17 +101,17 @@ struct cgvk_Image {
     uint16_t height;
     uint16_t depth;
     uint16_t layers;
-};
+} cgvk_Image;
 
-struct cgvk_ImagePool {
+typedef struct cgvk_ImagePool {
     const cgvk_Device* dev;
     uint16_t total_count;
     uint16_t free_count;
     uint16_t free_indices[CGVK_MAX_IMAGE_POOL_CAPACITY];
     cgvk_Image objects[CGVK_MAX_IMAGE_POOL_CAPACITY];
-};
+} cgvk_ImagePool;
 
-struct cgvk_Swapchain {
+typedef struct cgvk_Swapchain {
     const cgvk_Device* dev;
     VkSwapchainKHR swapchain;
     cgvk_Format format;
@@ -118,16 +119,16 @@ struct cgvk_Swapchain {
     uint16_t width;
     uint16_t height;
     cgvk_Image* images[CGVK_MAX_SWAPCHAIN_IMAGE_COUNT];
-};
+} cgvk_Swapchain;
 
-struct cgvk_SemaphorePool {
+typedef struct cgvk_SemaphorePool {
     uint16_t total_count;
     uint16_t used_count;
     VkDevice device;
     VkSemaphore semaphores[CGVK_MAX_SEMAPHORE_POOL_CAPACITY];
-};
+} cgvk_SemaphorePool;
 
-struct cgvk_FrameList {
+typedef struct cgvk_FrameList {
     const cgvk_Device* dev;
     const cgvk_Swapchain* swp;
     uint64_t frame_counter;
@@ -137,41 +138,41 @@ struct cgvk_FrameList {
     cgvk_SemaphorePool semaphores[CGVK_FRAME_LAG];
     VkFence fences[CGVK_FRAME_LAG];
     VkCommandPool main_command_pools[CGVK_FRAME_LAG];
-};
+} cgvk_FrameList;
 
-struct cgvk_Shader {
+typedef struct cgvk_Shader {
     XXH64_hash_t key;
     VkShaderModule module;
     struct cgvk_Shader* next;
     struct cgvk_Shader* prev;
     UT_hash_handle hh;
-};
+} cgvk_Shader;
 
-struct cgvk_ShaderCache {
+typedef struct cgvk_ShaderCache {
     const cgvk_Device* dev;
     cgvk_Shader* head;
     cgvk_Shader* oldest;
     cgvk_Shader* newest;
     uint16_t total_count;
     cgvk_Shader objects[CGVK_MAX_SHADER_CACHE_CAPACITY];
-};
+} cgvk_ShaderCache;
 
-struct cgvk_MainRenderPass {
+typedef struct cgvk_MainRenderPass {
     const cgvk_Device* dev;
     const cgvk_Swapchain* swp;
     VkRenderPass render_pass;
     VkFramebuffer framebuffers[CGVK_MAX_SWAPCHAIN_IMAGE_COUNT];
     VkPipelineLayout empty_pipeline_layout;
     VkPipeline hello_triangle_pipeline;
-};
+} cgvk_MainRenderPass;
 
-struct cgvk_Renderer {
+typedef struct cgvk_Renderer {
     const cgvk_Device* dev;
     const cgvk_Swapchain* swp;
     cgvk_FrameList frames;
     cgvk_ImagePool images;
     cgvk_MainRenderPass rp;
-};
+} cgvk_Renderer;
 
 // ============================================================================
 
@@ -190,16 +191,24 @@ static void cgvk_free_image(cgvk_Image* img)
     if (img->memory)
         vmaDestroyImage(img->dev->allocator, img->image, img->memory);
 
-    if (img->pool)
-        img->pool->free_indices[img->pool->free_count++] = img - img->pool->objects;
+    if (img->pool) {
+        ptrdiff_t offset = img - img->pool->objects;
+        assert(offset < UINT16_MAX);
+        img->pool->free_indices[img->pool->free_count++] = (uint16_t)offset;
+    }
 
     memset(img, 0, sizeof(cgvk_Image));
+    img->dev = NULL;
+    img->pool = NULL;
+    img->memory = VK_NULL_HANDLE;
+    img->image = VK_NULL_HANDLE;
+    img->image_view = VK_NULL_HANDLE;
 }
 
 static cgvk_Image* cgvk_allocate_image(cgvk_ImagePool* pool)
 {
     cgvk_Image* img = NULL;
-    size_t id = SIZE_MAX;
+    uint16_t id = UINT16_MAX;
 
     if (pool->free_count > 0) {
         id = pool->free_indices[--pool->free_count];
@@ -210,10 +219,16 @@ static cgvk_Image* cgvk_allocate_image(cgvk_ImagePool* pool)
         img = &pool->objects[id];
     }
 
+    assert(img);
+    assert(id < UINT16_MAX);
+
     memset(img, 0, sizeof(cgvk_Image));
     img->dev = pool->dev;
     img->pool = pool;
     img->id = id;
+    img->memory = VK_NULL_HANDLE;
+    img->image = VK_NULL_HANDLE;
+    img->image_view = VK_NULL_HANDLE;
 
     return img;
 }
@@ -234,6 +249,7 @@ static void cgvk_kill_image_pool(cgvk_ImagePool* pool)
     }
 
     memset(pool, 0, sizeof(cgvk_ImagePool));
+    pool->dev = NULL;
 }
 
 // ============================================================================
@@ -262,7 +278,7 @@ static void cgvk_touch_shader(cgvk_ShaderCache* cache, cgvk_Shader* sh)
     cache->newest = sh;
 }
 
-static cgvk_Shader* cgvk_get_shader(cgvk_ShaderCache* cache, size_t size, const void* code)
+static cgvk_Shader* cgvk_get_shader_by_code(cgvk_ShaderCache* cache, size_t size, const void* code)
 {
     XXH64_hash_t key = XXH64(code, size, 0);
     cgvk_Shader* sh = NULL;
@@ -311,22 +327,13 @@ static cgvk_Shader* cgvk_get_shader(cgvk_ShaderCache* cache, size_t size, const 
     return sh;
 }
 
-static cgvk_Shader* cgvk_get_shader(cgvk_ShaderCache* cache, XXH64_hash_t key)
-{
-    cgvk_Shader* sh = NULL;
-    HASH_FIND(hh, cache->head, &key, sizeof(XXH64_hash_t), sh);
-    if (sh) {
-        cgvk_touch_shader(cache, sh);
-    } else {
-        log_error("cannot find the shader of the hash: %llx", key);
-    }
-    return sh;
-}
-
 static void cgvk_init_shader_cache(const cgvk_Device* dev, cgvk_ShaderCache* cache)
 {
     memset(cache, 0, sizeof(cgvk_ShaderCache));
     cache->dev = dev;
+    cache->head = NULL;
+    cache->oldest = NULL;
+    cache->newest = NULL;
 }
 
 static void cgvk_kill_shader_cache(cgvk_ShaderCache* cache)
@@ -337,6 +344,10 @@ static void cgvk_kill_shader_cache(cgvk_ShaderCache* cache)
     }
 
     memset(cache, 0, sizeof(cgvk_ShaderCache));
+    cache->dev = NULL;
+    cache->head = NULL;
+    cache->oldest = NULL;
+    cache->newest = NULL;
 }
 
 // ============================================================================
@@ -453,8 +464,8 @@ static void cgvk_init_main_render_pass(const cgvk_Device* dev, const cgvk_Swapch
         cgvk_ShaderCache cache;
         cgvk_init_shader_cache(rp->dev, &cache);
 
-        auto vs = cgvk_get_shader(&cache, sizeof(vert_code), vert_code);
-        auto fs = cgvk_get_shader(&cache, sizeof(frag_code), frag_code);
+        cgvk_Shader* vs = cgvk_get_shader_by_code(&cache, sizeof(vert_code), vert_code);
+        cgvk_Shader* fs = cgvk_get_shader_by_code(&cache, sizeof(frag_code), frag_code);
 
         VkPipelineShaderStageCreateInfo stages[2] = {
             {
@@ -681,6 +692,7 @@ static void cgvk_kill_semaphore_pool(cgvk_SemaphorePool* pool)
     }
 
     memset(pool, 0, sizeof(cgvk_SemaphorePool));
+    pool->device = VK_NULL_HANDLE;
 }
 
 // ============================================================================
@@ -689,14 +701,15 @@ static void cgvk_begin_frame(cgvk_FrameList* fl)
 {
     const size_t fidx = fl->frame_counter % CGVK_FRAME_LAG;
 
-    uint32_t image_index = -1;
+    uint32_t image_index = UINT32_MAX;
     VkSemaphore semaphore = cgvk_allocate_semaphore(&fl->semaphores[fidx]);
     VkResult result = vkAcquireNextImageKHR(fl->dev->device, fl->swp->swapchain, UINT64_MAX, semaphore, VK_NULL_HANDLE, &image_index);
     if (result != VK_SUCCESS) {
         log_fatal("vkAcquireNextImageKHR failed: %d", (int)result);
         abort();
     }
-    fl->present_image_indices[fidx] = image_index;
+    assert(image_index < UINT8_MAX);
+    fl->present_image_indices[fidx] = (uint8_t)image_index;
     fl->acquire_next_image_semaphores[fidx] = semaphore;
 }
 
@@ -879,7 +892,7 @@ static void cgvk_end_frame(cgvk_FrameList* fl)
     // clear cached data
     fl->acquire_next_image_semaphores[fidx] = VK_NULL_HANDLE;
     fl->render_frame_semaphores[fidx] = VK_NULL_HANDLE;
-    fl->present_image_indices[fidx] = -1;
+    fl->present_image_indices[fidx] = UINT8_MAX;
 
     // ================ NEXT FRAME ==================
 
@@ -1021,7 +1034,7 @@ static VkPresentModeKHR cgvk_choose_present_mode(const cgvk_Device* dev, VkSurfa
         abort();
     }
 
-    for (int i = 0, n = present_mode_count; i < n; ++i) {
+    for (unsigned i = 0, n = present_mode_count; i < n; ++i) {
         if (present_modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) {
             present_mode = VK_PRESENT_MODE_MAILBOX_KHR;
             break;
@@ -1066,7 +1079,7 @@ static void cgvk_choose_surface_format(
         fmt = CGVK_FORMAT_B8G8R8A8_SRGB;
         format = VK_FORMAT_B8G8R8A8_SRGB;
     } else {
-        for (int i = 0, n = format_count; i < n; ++i) {
+        for (unsigned i = 0, n = format_count; i < n; ++i) {
             const VkSurfaceFormatKHR* f = &formats[i];
             if (f->format == VK_FORMAT_B8G8R8A8_SRGB) {
                 fmt = CGVK_FORMAT_B8G8R8A8_SRGB;
@@ -1173,7 +1186,7 @@ static void cgvk_init_swapchain(const cgvk_Device* dev, cgvk_ImagePool* imgpool,
 
     // Create image views
     VkImageView image_views[image_count];
-    for (int i = 0, n = image_count; i < n; ++i) {
+    for (unsigned i = 0, n = image_count; i < n; ++i) {
         VkImageViewCreateInfo create_info = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
             .pNext = NULL,
@@ -1202,22 +1215,25 @@ static void cgvk_init_swapchain(const cgvk_Device* dev, cgvk_ImagePool* imgpool,
         }
     }
 
+    assert(extent.width < UINT16_MAX);
+    assert(extent.height < UINT16_MAX);
+
     // Fill the fields
     swp->dev = dev;
     swp->swapchain = swapchain;
     swp->format = fmt;
-    swp->image_count = image_count;
-    swp->width = extent.width;
-    swp->height = extent.height;
+    swp->image_count = (uint8_t)image_count;
+    swp->width = (uint16_t)extent.width;
+    swp->height = (uint16_t)extent.height;
 
     // Init images
-    for (int i = 0, n = image_count; i < n; ++i) {
+    for (unsigned i = 0, n = image_count; i < n; ++i) {
         cgvk_Image* img = cgvk_allocate_image(imgpool);
         img->image = images[i];
         img->image_view = image_views[i];
         img->format = fmt;
-        img->width = extent.width;
-        img->height = extent.height;
+        img->width = (uint16_t)extent.width;
+        img->height = (uint16_t)extent.height;
         img->depth = 1;
         img->levels = 1;
         img->layers = 1;
@@ -1285,14 +1301,14 @@ static void cgvk_choose_queue_families(
     vkGetPhysicalDeviceQueueFamilyProperties(gpu, &queue_family_count, properties);
 
     VkBool32 supported[queue_family_count];
-    for (int i = 0, n = queue_family_count; i < n; ++i) {
+    for (unsigned i = 0, n = queue_family_count; i < n; ++i) {
         VkResult result = vkGetPhysicalDeviceSurfaceSupportKHR(gpu, i, surface, &supported[i]);
         if (result != VK_SUCCESS) {
             log_fatal("vkGetPhysicalDeviceSurfaceSupportKHR failed: %d", (int)result);
             abort();
         }
     }
-    for (uint32_t i = 0, n = queue_family_count; i < n; ++i) {
+    for (unsigned i = 0, n = queue_family_count; i < n; ++i) {
         const VkQueueFamilyProperties* p = &properties[i];
         if (p->queueCount == 0)
             continue;
@@ -1390,7 +1406,7 @@ static void cgvk_init_device(cgvk_Device* dev)
                 log_fatal("vkEnumerateDeviceExtensionProperties failed: %d", (int)result);
                 abort();
             }
-            for (uint32_t i = 0, n = available_extension_count; i < n; ++i) {
+            for (unsigned i = 0, n = available_extension_count; i < n; ++i) {
                 const VkExtensionProperties* props = &properties[i];
                 const char* extname = props->extensionName;
                 if (strcmp(extname, VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0) {
@@ -1810,6 +1826,8 @@ static void cgvk_get_drawable_extent(VkExtent2D* extent)
 {
     int w, h;
     SDL_Vulkan_GetDrawableSize(window_, &w, &h);
-    extent->width = w;
-    extent->height = h;
+    assert(w > 0);
+    assert(h > 0);
+    extent->width = (uint32_t)w;
+    extent->height = (uint32_t)h;
 }

@@ -8,6 +8,9 @@ find_program(GLSLANG_VALIDATOR
     HINTS $ENV{HOME}/.local/bin "/usr/local/bin" "/usr/bin"
 )
 
+# ============================================
+# Shaders
+
 function(compile_shader fname)
     add_custom_command(
         COMMENT "Compile shader: ${fname} -> ${fname}.inc"
@@ -28,10 +31,13 @@ endfunction()
 compile_shader(triangle.vert)
 compile_shader(triangle.frag)
 
+# ============================================
+# Library
+
 add_library(cgvk SHARED)
 target_sources(cgvk
 PRIVATE
-    cgvk.cc
+    cgvk.c
     vk_mem_alloc.cc
     volk.c
     log.c
@@ -46,17 +52,27 @@ PRIVATE
     "-g"
     "-Wall"
     "-fno-exceptions"
-    #"-Wpointer-sign"
-    #"-Wpedantic"
 )
 target_link_libraries(cgvk PUBLIC SDL2::SDL2)
-
 target_compile_definitions(cgvk
 PRIVATE
     VK_USE_PLATFORM_WAYLAND_KHR
     VK_USE_PLATFORM_XCB_KHR
     VK_USE_PLATFORM_XLIB_KHR
 )
+set_target_properties(cgvk
+PROPERTIES
+    C_STANDARD 99
+    CXX_STANDARD 11
+)
+set_source_files_properties(cgvk.c
+PROPERTIES
+    C_STANDARD 99
+    COMPILE_OPTIONS "-Werror=implicit;-fstrict-aliasing;-Wconversion;-Wpedantic;-Wc++-compat"
+)
+
+# ============================================
+# Examples
 
 add_executable(ex-hello ex-hello.c)
 target_link_libraries(ex-hello PRIVATE cgvk)
