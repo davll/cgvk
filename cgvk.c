@@ -19,10 +19,7 @@
 #define CGVK_VERSION_PATCH 0
 
 #define CGVK_FRAME_LAG 3
-#define CGVK_MAX_IMAGE_POOL_CAPACITY 1024
 #define CGVK_MAX_SWAPCHAIN_IMAGE_COUNT 16
-#define CGVK_MAX_SEMAPHORE_POOL_CAPACITY 64
-#define CGVK_MAX_SHADER_CACHE_CAPACITY 1024
 
 // ============================================================================
 
@@ -75,12 +72,14 @@ typedef struct cgvk_Device {
 
 typedef struct cgvk_Image {
     const cgvk_Device* dev;
-    struct cgvk_ImagePool* pool;
+    union {
+        struct cgvk_ImagePool* pool;
+        struct cgvk_Image* next;
+    };
     VmaAllocation memory;
     VkImage image;
     VkImageView image_view;
     cgvk_Format format;
-    uint16_t id;
     uint16_t levels: 5;
     uint16_t aspect_color: 1;
     uint16_t aspect_depth: 1;
@@ -93,10 +92,10 @@ typedef struct cgvk_Image {
 
 typedef struct cgvk_ImagePool {
     const cgvk_Device* dev;
-    uint16_t total_count;
-    uint16_t free_count;
-    uint16_t free_indices[CGVK_MAX_IMAGE_POOL_CAPACITY];
-    cgvk_Image objects[CGVK_MAX_IMAGE_POOL_CAPACITY];
+    cgvk_Image* free;
+    uint32_t capacity;
+    uint32_t count;
+    cgvk_Image objects[];
 } cgvk_ImagePool;
 
 typedef struct cgvk_Swapchain {
@@ -110,10 +109,11 @@ typedef struct cgvk_Swapchain {
 } cgvk_Swapchain;
 
 typedef struct cgvk_SemaphorePool {
+    uint16_t capacity;
     uint16_t total_count;
     uint16_t used_count;
     VkDevice device;
-    VkSemaphore semaphores[CGVK_MAX_SEMAPHORE_POOL_CAPACITY];
+    VkSemaphore semaphores[];
 } cgvk_SemaphorePool;
 
 typedef struct cgvk_FrameList {
@@ -123,7 +123,7 @@ typedef struct cgvk_FrameList {
     uint8_t present_image_indices[CGVK_FRAME_LAG];
     VkSemaphore acquire_next_image_semaphores[CGVK_FRAME_LAG];
     VkSemaphore render_frame_semaphores[CGVK_FRAME_LAG];
-    cgvk_SemaphorePool semaphores[CGVK_FRAME_LAG];
+    cgvk_SemaphorePool* semaphores[CGVK_FRAME_LAG];
     VkFence fences[CGVK_FRAME_LAG];
     VkCommandPool main_command_pools[CGVK_FRAME_LAG];
 } cgvk_FrameList;
@@ -141,8 +141,9 @@ typedef struct cgvk_ShaderCache {
     cgvk_Shader* head;
     cgvk_Shader* oldest;
     cgvk_Shader* newest;
-    uint16_t total_count;
-    cgvk_Shader objects[CGVK_MAX_SHADER_CACHE_CAPACITY];
+    uint32_t capacity;
+    uint32_t count;
+    cgvk_Shader objects[];
 } cgvk_ShaderCache;
 
 typedef struct cgvk_MainRenderPass {
@@ -158,7 +159,7 @@ typedef struct cgvk_Renderer {
     const cgvk_Device* dev;
     const cgvk_Swapchain* swp;
     cgvk_FrameList frames;
-    cgvk_ImagePool images;
+    cgvk_ImagePool* images;
     cgvk_MainRenderPass rp;
 } cgvk_Renderer;
 
@@ -179,41 +180,40 @@ static void cgvk_free_image(cgvk_Image* img)
     if (img->memory)
         vmaDestroyImage(img->dev->allocator, img->image, img->memory);
 
-    if (img->pool) {
-        ptrdiff_t offset = img - img->pool->objects;
-        assert(offset < UINT16_MAX);
-        img->pool->free_indices[img->pool->free_count++] = (uint16_t)offset;
-    }
+    cgvk_ImagePool* pool = img->pool;
 
     memset(img, 0, sizeof(cgvk_Image));
     img->dev = NULL;
-    img->pool = NULL;
     img->memory = VK_NULL_HANDLE;
     img->image = VK_NULL_HANDLE;
     img->image_view = VK_NULL_HANDLE;
+
+    if (pool) {
+        img->next = pool->free;
+        pool->free = img;
+    } else {
+        img->next = NULL;
+    }
 }
 
 static cgvk_Image* cgvk_allocate_image(cgvk_ImagePool* pool)
 {
     cgvk_Image* img = NULL;
-    uint16_t id = UINT16_MAX;
 
-    if (pool->free_count > 0) {
-        id = pool->free_indices[--pool->free_count];
-        img = &pool->objects[id];
+    if (pool->free) {
+        img = pool->free;
+        pool->free = pool->free->next;
     } else {
-        assert(pool->total_count < CGVK_MAX_IMAGE_POOL_CAPACITY);
-        id = pool->total_count++;
+        assert(pool->count < pool->capacity);
+        size_t id = pool->count++;
         img = &pool->objects[id];
     }
 
     assert(img);
-    assert(id < UINT16_MAX);
 
     memset(img, 0, sizeof(cgvk_Image));
     img->dev = pool->dev;
     img->pool = pool;
-    img->id = id;
     img->memory = VK_NULL_HANDLE;
     img->image = VK_NULL_HANDLE;
     img->image_view = VK_NULL_HANDLE;
@@ -221,23 +221,29 @@ static cgvk_Image* cgvk_allocate_image(cgvk_ImagePool* pool)
     return img;
 }
 
-static void cgvk_init_image_pool(const cgvk_Device* dev, cgvk_ImagePool* pool)
+static cgvk_ImagePool* cgvk_new_image_pool(const cgvk_Device* dev, uint32_t capacity)
 {
+    size_t size = sizeof(cgvk_ImagePool) + sizeof(cgvk_Image) * capacity;
+
+    cgvk_ImagePool* pool = (cgvk_ImagePool*)malloc(size);
+
     memset(pool, 0, sizeof(cgvk_ImagePool));
     pool->dev = dev;
+    pool->capacity = capacity;
+
+    return pool;
 }
 
-static void cgvk_kill_image_pool(cgvk_ImagePool* pool)
+static void cgvk_free_image_pool(cgvk_ImagePool* pool)
 {
-    for (int i = 0, n = pool->total_count; i < n; ++i) {
-        if (!pool->objects[i].pool)
+    for (unsigned i = 0, n = pool->count; i < n; ++i) {
+        if (!pool->objects[i].dev)
             continue;
         pool->objects[i].pool = NULL;
         cgvk_free_image(&pool->objects[i]);
     }
 
-    memset(pool, 0, sizeof(cgvk_ImagePool));
-    pool->dev = NULL;
+    free(pool);
 }
 
 // ============================================================================
@@ -275,8 +281,8 @@ static cgvk_Shader* cgvk_get_shader_by_code(cgvk_ShaderCache* cache, size_t size
     if (sh) {
         cgvk_touch_shader(cache, sh);
     } else {
-        if (cache->total_count < CGVK_MAX_SHADER_CACHE_CAPACITY) {
-            sh = &cache->objects[cache->total_count++];
+        if (cache->count < cache->capacity) {
+            sh = &cache->objects[cache->count++];
         } else { // purge oldest
             assert(cache->oldest);
             assert(cache->oldest != cache->newest);
@@ -315,27 +321,30 @@ static cgvk_Shader* cgvk_get_shader_by_code(cgvk_ShaderCache* cache, size_t size
     return sh;
 }
 
-static void cgvk_init_shader_cache(const cgvk_Device* dev, cgvk_ShaderCache* cache)
+static cgvk_ShaderCache* cgvk_new_shader_cache(const cgvk_Device* dev, uint32_t capacity)
 {
-    memset(cache, 0, sizeof(cgvk_ShaderCache));
+    size_t size = sizeof(cgvk_ShaderCache) + sizeof(cgvk_Shader) * capacity;
+
+    cgvk_ShaderCache* cache = (cgvk_ShaderCache*)malloc(size);
+
+    memset(cache, 0, size);
     cache->dev = dev;
+    cache->capacity = capacity;
     cache->head = NULL;
     cache->oldest = NULL;
     cache->newest = NULL;
+
+    return cache;
 }
 
-static void cgvk_kill_shader_cache(cgvk_ShaderCache* cache)
+static void cgvk_free_shader_cache(cgvk_ShaderCache* cache)
 {
-    for (int i = 0, n = cache->total_count; i < n; ++i) {
+    for (unsigned i = 0, n = cache->count; i < n; ++i) {
         if (cache->objects[i].module)
             vkDestroyShaderModule(cache->dev->device, cache->objects[i].module, NULL);
     }
 
-    memset(cache, 0, sizeof(cgvk_ShaderCache));
-    cache->dev = NULL;
-    cache->head = NULL;
-    cache->oldest = NULL;
-    cache->newest = NULL;
+    free(cache);
 }
 
 // ============================================================================
@@ -449,11 +458,10 @@ static void cgvk_init_main_render_pass(const cgvk_Device* dev, const cgvk_Swapch
             #include "triangle.frag.inc"
         };
 
-        cgvk_ShaderCache cache;
-        cgvk_init_shader_cache(rp->dev, &cache);
+        cgvk_ShaderCache* cache = cgvk_new_shader_cache(rp->dev, 2);
 
-        cgvk_Shader* vs = cgvk_get_shader_by_code(&cache, sizeof(vert_code), vert_code);
-        cgvk_Shader* fs = cgvk_get_shader_by_code(&cache, sizeof(frag_code), frag_code);
+        cgvk_Shader* vs = cgvk_get_shader_by_code(cache, sizeof(vert_code), vert_code);
+        cgvk_Shader* fs = cgvk_get_shader_by_code(cache, sizeof(frag_code), frag_code);
 
         VkPipelineShaderStageCreateInfo stages[2] = {
             {
@@ -587,7 +595,7 @@ static void cgvk_init_main_render_pass(const cgvk_Device* dev, const cgvk_Swapch
             abort();
         }
 
-        cgvk_kill_shader_cache(&cache);
+        cgvk_free_shader_cache(cache);
     }
 
     // framebuffers
@@ -644,7 +652,7 @@ static VkSemaphore cgvk_allocate_semaphore(cgvk_SemaphorePool* pool)
         return pool->semaphores[pool->used_count++];
     } else {
         assert(pool->used_count == pool->total_count);
-        assert(pool->total_count < CGVK_MAX_SEMAPHORE_POOL_CAPACITY);
+        assert(pool->total_count < pool->capacity);
         VkSemaphoreCreateInfo create_info = {
             .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
             .pNext = NULL,
@@ -667,20 +675,26 @@ static void cgvk_reset_semaphore_pool(cgvk_SemaphorePool* pool)
     pool->used_count = 0;
 }
 
-static void cgvk_init_semaphore_pool(const cgvk_Device* dev, cgvk_SemaphorePool* pool)
+static cgvk_SemaphorePool* cgvk_new_semaphore_pool(const cgvk_Device* dev, uint16_t capacity)
 {
-    memset(pool, 0, sizeof(cgvk_SemaphorePool));
+    size_t size = sizeof(cgvk_SemaphorePool) + sizeof(VkSemaphore) * capacity;
+
+    cgvk_SemaphorePool* pool = (cgvk_SemaphorePool*)malloc(size);
+
+    memset(pool, 0, size);
     pool->device = dev->device;
+    pool->capacity = capacity;
+
+    return pool;
 }
 
-static void cgvk_kill_semaphore_pool(cgvk_SemaphorePool* pool)
+static void cgvk_free_semaphore_pool(cgvk_SemaphorePool* pool)
 {
     for (int i = 0, n = pool->total_count; i < n; ++i) {
         vkDestroySemaphore(pool->device, pool->semaphores[i], NULL);
     }
 
-    memset(pool, 0, sizeof(cgvk_SemaphorePool));
-    pool->device = VK_NULL_HANDLE;
+    free(pool);
 }
 
 // ============================================================================
@@ -690,7 +704,7 @@ static void cgvk_begin_frame(cgvk_FrameList* fl)
     const size_t fidx = fl->frame_counter % CGVK_FRAME_LAG;
 
     uint32_t image_index = UINT32_MAX;
-    VkSemaphore semaphore = cgvk_allocate_semaphore(&fl->semaphores[fidx]);
+    VkSemaphore semaphore = cgvk_allocate_semaphore(fl->semaphores[fidx]);
     VkResult result = vkAcquireNextImageKHR(fl->dev->device, fl->swp->swapchain, UINT64_MAX, semaphore, VK_NULL_HANDLE, &image_index);
     if (result != VK_SUCCESS) {
         log_fatal("vkAcquireNextImageKHR failed: %d", (int)result);
@@ -814,7 +828,7 @@ static void cgvk_render_frame(cgvk_Renderer* rnd)
 
     // submit main command buffer
     {
-        VkSemaphore semaphore = cgvk_allocate_semaphore(&rnd->frames.semaphores[fidx]);
+        VkSemaphore semaphore = cgvk_allocate_semaphore(rnd->frames.semaphores[fidx]);
         rnd->frames.render_frame_semaphores[fidx] = semaphore;
 
         uint32_t wait_semaphore_count = 1;
@@ -899,7 +913,7 @@ static void cgvk_end_frame(cgvk_FrameList* fl)
 
     // reset the frame context
     {
-        cgvk_reset_semaphore_pool(&fl->semaphores[fidx]);
+        cgvk_reset_semaphore_pool(fl->semaphores[fidx]);
 
         VkResult result = vkResetCommandPool(fl->dev->device, fl->main_command_pools[fidx], 0);
         if (result != VK_SUCCESS) {
@@ -916,7 +930,7 @@ static void cgvk_init_frame_list(const cgvk_Device* dev, const cgvk_Swapchain* s
     fl->swp = swp;
 
     for (int i = 0; i < CGVK_FRAME_LAG; ++i)
-        cgvk_init_semaphore_pool(dev, &fl->semaphores[i]);
+        fl->semaphores[i] = cgvk_new_semaphore_pool(dev, 16);
     
     // fences
     {
@@ -955,7 +969,7 @@ static void cgvk_init_frame_list(const cgvk_Device* dev, const cgvk_Swapchain* s
 static void cgvk_kill_frame_list(cgvk_FrameList* fl)
 {
     for (int i = 0; i < CGVK_FRAME_LAG; ++i)
-        cgvk_kill_semaphore_pool(&fl->semaphores[i]);
+        cgvk_free_semaphore_pool(fl->semaphores[i]);
 
     for (int i = 0; i < CGVK_FRAME_LAG; ++i)
         vkDestroyFence(fl->dev->device, fl->fences[i], NULL);
@@ -1730,9 +1744,9 @@ CGVK_API void cgvk_init(const char* appname)
 
     //
     cgvk_init_device(&dev_);
-    cgvk_init_image_pool(&dev_, &rnd_.images);
-    cgvk_init_swapchain(&dev_, &rnd_.images, &swp_);
-    cgvk_init_main_render_pass(&dev_, &swp_, &rnd_.images, &rnd_.rp);
+    rnd_.images = cgvk_new_image_pool(&dev_, 1024);
+    cgvk_init_swapchain(&dev_, rnd_.images, &swp_);
+    cgvk_init_main_render_pass(&dev_, &swp_, rnd_.images, &rnd_.rp);
     cgvk_init_frame_list(&dev_, &swp_, &rnd_.frames);
     rnd_.dev = &dev_;
     rnd_.swp = &swp_;
@@ -1752,7 +1766,7 @@ CGVK_API void cgvk_quit()
     cgvk_kill_frame_list(&rnd_.frames);
     cgvk_kill_main_render_pass(&rnd_.rp);
     cgvk_kill_swapchain(&swp_);
-    cgvk_kill_image_pool(&rnd_.images);
+    cgvk_free_image_pool(rnd_.images);
     cgvk_kill_device(&dev_);
 
     // Destroy surface and window
