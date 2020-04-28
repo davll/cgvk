@@ -70,6 +70,30 @@ typedef struct cgvk_Device {
     uint32_t present_queue_family;
 } cgvk_Device;
 
+typedef struct cgvk_TransientBuffer {
+    VmaAllocation memory;
+    VkBuffer buffer;
+    uint32_t tag;
+    uint32_t used;
+    VkMemoryPropertyFlags properties;
+    void* mapped;
+    struct cgvk_TransientBuffer* next;
+} cgvk_TransientBuffer;
+
+typedef struct cgvk_TransientAllocator {
+    const cgvk_Device* dev;
+    uint32_t buffer_size;
+    uint16_t capacity;
+    uint16_t count;
+    VkBufferUsageFlags usage;
+    cgvk_TransientBuffer* pending_head;
+    cgvk_TransientBuffer* pending_tail;
+    cgvk_TransientBuffer* used_head;
+    cgvk_TransientBuffer* used_tail;
+    cgvk_TransientBuffer* free;
+    cgvk_TransientBuffer buffers[];
+} cgvk_TransientAllocator;
+
 typedef struct cgvk_Image {
     const cgvk_Device* dev;
     union {
@@ -167,6 +191,170 @@ typedef struct cgvk_Renderer {
 
 static VkFormat cgvk_decode_format(cgvk_Format fmt);
 static VkImageLayout cgvk_decode_image_layout(cgvk_ImageLayout l);
+
+// ============================================================================
+
+static void cgvk_reset_transient_buffers(cgvk_TransientAllocator* talloc, uint32_t tag)
+{
+    cgvk_TransientBuffer* src = talloc->used_head;
+    cgvk_TransientBuffer *head = NULL, *tail = NULL, *tmp;
+    while (src) {
+        tmp = src->next;
+        src->next = NULL;
+        if (src->tag == tag) {
+            if (src->mapped) {
+                vmaUnmapMemory(talloc->dev->allocator, src->memory);
+                src->mapped = NULL;
+            }
+            src->tag = 0;
+            src->used = 0;
+            src->next = talloc->free;
+            talloc->free = src;
+        } else if (tail) {
+            tail->next = src;
+            tail = src;
+        } else {
+            head = tail = src;
+        }
+        src = tmp;
+    }
+    talloc->used_head = head;
+    talloc->used_tail = tail;
+}
+
+static void cgvk_submit_transient_buffers(cgvk_TransientAllocator* talloc)
+{
+    cgvk_TransientBuffer *cur = talloc->pending_head;
+    while (cur) {
+        if (cur->mapped) {
+            if (!(cur->properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+                vmaFlushAllocation(talloc->dev->allocator, cur->memory, 0, cur->used);
+            }
+            vmaUnmapMemory(talloc->dev->allocator, cur->memory);
+            cur->mapped = NULL;
+        }
+        cur = cur->next;
+    }
+
+    if (talloc->used_tail) {
+        talloc->used_tail->next = talloc->pending_head;
+        talloc->used_tail = talloc->pending_tail;
+    } else {
+        talloc->used_head = talloc->pending_head;
+        talloc->used_tail = talloc->pending_tail;
+    }
+    talloc->pending_tail = talloc->pending_head = NULL;
+}
+
+static void* cgvk_allocate_transient_block(cgvk_TransientAllocator* talloc, uint32_t tag, size_t size)
+{
+    assert(size <= talloc->buffer_size);
+
+    cgvk_TransientBuffer *cur = talloc->pending_head;
+    while (cur) {
+        if (cur->tag == tag && cur->used + size <= talloc->buffer_size) {
+            break;
+        }
+        cur = cur->next;
+    }
+
+    if (!cur) {
+        if (talloc->free) {
+            cur = talloc->free;
+            talloc->free = talloc->free->next;
+        } else {
+            assert(talloc->count < talloc->capacity);
+            cur = &talloc->buffers[talloc->count++];
+            memset(cur, 0, sizeof(cgvk_TransientBuffer));
+            cur->mapped = NULL;
+            
+            VkBufferCreateInfo create_info = {
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .pNext = NULL,
+                .flags = 0,
+                .size = talloc->buffer_size,
+                .usage = talloc->usage,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .queueFamilyIndexCount = 0,
+                .pQueueFamilyIndices = NULL,
+            };
+
+            VmaAllocationCreateInfo alloc_info = {
+                .flags = VMA_ALLOCATION_CREATE_STRATEGY_BEST_FIT_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                .usage = VMA_MEMORY_USAGE_CPU_TO_GPU,
+                .requiredFlags = 0,
+                .preferredFlags = 0,
+                .memoryTypeBits = 0,
+                .pool = VK_NULL_HANDLE,
+                .pUserData = NULL,
+            };
+
+            VmaAllocationInfo info;
+            VkResult result = vmaCreateBuffer(talloc->dev->allocator, &create_info, &alloc_info, &cur->buffer, &cur->memory, &info);
+            if (result != VK_SUCCESS) {
+                log_fatal("vmaCreateBuffer failed: %d", (int)result);
+                abort();
+            }
+
+            uint32_t mem_type = info.memoryType;
+            vmaGetMemoryTypeProperties(talloc->dev->allocator, mem_type, &cur->properties);
+
+            cur->mapped = info.pMappedData;
+        }
+
+        cur->tag = tag;
+        cur->next = NULL;
+
+        if (talloc->pending_tail) {
+            talloc->pending_tail->next = cur;
+            talloc->pending_tail = cur;
+        } else {
+            talloc->pending_head = talloc->pending_tail = cur;
+        }
+    }
+
+    if (!cur->mapped) {
+        VkResult result = vmaMapMemory(talloc->dev->allocator, cur->memory, &cur->mapped);
+        if (result != VK_SUCCESS) {
+            log_fatal("vmaMapMemory failed: %d", (int)result);
+            abort();
+        }
+    }
+
+    void* addr = (uint8_t*)cur->mapped + cur->used;
+    cur->used += (uint32_t)size;
+    return addr;
+}
+
+static cgvk_TransientAllocator* cgvk_new_transient_allocator(const cgvk_Device* dev, uint32_t buffer_size, uint16_t capacity)
+{
+    size_t size = sizeof(cgvk_TransientAllocator) + sizeof(cgvk_TransientBuffer) * capacity;
+
+    cgvk_TransientAllocator* talloc = (cgvk_TransientAllocator*)malloc(size);
+
+    memset(talloc, 0, size);
+    talloc->dev = dev;
+    talloc->buffer_size = buffer_size;
+    talloc->capacity = capacity;
+    talloc->free = NULL;
+    talloc->pending_head = NULL;
+    talloc->pending_tail = NULL;
+    talloc->used_head = NULL;
+    talloc->used_tail = NULL;
+    talloc->usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+
+    return talloc;
+}
+
+static void cgvk_free_transient_allocator(cgvk_TransientAllocator* talloc)
+{
+    for (unsigned i = 0, n = talloc->count; i < n; ++i) {
+        cgvk_TransientBuffer* tbuf = &talloc->buffers[i];
+        vmaDestroyBuffer(talloc->dev->allocator, tbuf->buffer, tbuf->memory);
+    }
+
+    free(talloc);
+}
 
 // ============================================================================
 
