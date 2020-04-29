@@ -19,7 +19,6 @@
 #define CGVK_VERSION_PATCH 0
 
 #define CGVK_FRAME_LAG 3
-#define CGVK_MAX_SWAPCHAIN_IMAGE_COUNT 16
 
 // ============================================================================
 
@@ -70,6 +69,13 @@ typedef struct cgvk_Device {
     uint32_t present_queue_family;
 } cgvk_Device;
 
+typedef struct cgvk_TransientBlock {
+    VkBuffer buffer;
+    uint32_t offset;
+    uint32_t size;
+    void* mapped;
+} cgvk_TransientBlock;
+
 typedef struct cgvk_TransientBuffer {
     VmaAllocation memory;
     VkBuffer buffer;
@@ -94,63 +100,20 @@ typedef struct cgvk_TransientAllocator {
     cgvk_TransientBuffer buffers[];
 } cgvk_TransientAllocator;
 
-typedef struct cgvk_Image {
-    const cgvk_Device* dev;
-    union {
-        struct cgvk_ImagePool* pool;
-        struct cgvk_Image* next;
-    };
-    VmaAllocation memory;
+typedef struct cgvk_SwapchainImage {
     VkImage image;
     VkImageView image_view;
-    cgvk_Format format;
-    uint16_t levels: 5;
-    uint16_t aspect_color: 1;
-    uint16_t aspect_depth: 1;
-    uint16_t aspect_stencil: 1;
-    uint16_t width;
-    uint16_t height;
-    uint16_t depth;
-    uint16_t layers;
-} cgvk_Image;
-
-typedef struct cgvk_ImagePool {
-    const cgvk_Device* dev;
-    cgvk_Image* free;
-    uint32_t capacity;
-    uint32_t count;
-    cgvk_Image objects[];
-} cgvk_ImagePool;
+} cgvk_SwapchainImage;
 
 typedef struct cgvk_Swapchain {
     const cgvk_Device* dev;
     VkSwapchainKHR swapchain;
     cgvk_Format format;
-    uint8_t image_count;
     uint16_t width;
     uint16_t height;
-    cgvk_Image* images[CGVK_MAX_SWAPCHAIN_IMAGE_COUNT];
+    uint8_t image_count;
+    cgvk_SwapchainImage images[];
 } cgvk_Swapchain;
-
-typedef struct cgvk_SemaphorePool {
-    uint16_t capacity;
-    uint16_t total_count;
-    uint16_t used_count;
-    VkDevice device;
-    VkSemaphore semaphores[];
-} cgvk_SemaphorePool;
-
-typedef struct cgvk_FrameList {
-    const cgvk_Device* dev;
-    const cgvk_Swapchain* swp;
-    uint64_t frame_counter;
-    uint8_t present_image_indices[CGVK_FRAME_LAG];
-    VkSemaphore acquire_next_image_semaphores[CGVK_FRAME_LAG];
-    VkSemaphore render_frame_semaphores[CGVK_FRAME_LAG];
-    cgvk_SemaphorePool* semaphores[CGVK_FRAME_LAG];
-    VkFence fences[CGVK_FRAME_LAG];
-    VkCommandPool main_command_pools[CGVK_FRAME_LAG];
-} cgvk_FrameList;
 
 typedef struct cgvk_Shader {
     XXH64_hash_t key;
@@ -170,21 +133,25 @@ typedef struct cgvk_ShaderCache {
     cgvk_Shader objects[];
 } cgvk_ShaderCache;
 
-typedef struct cgvk_MainRenderPass {
-    const cgvk_Device* dev;
-    const cgvk_Swapchain* swp;
-    VkRenderPass render_pass;
-    VkFramebuffer framebuffers[CGVK_MAX_SWAPCHAIN_IMAGE_COUNT];
-    VkPipelineLayout empty_pipeline_layout;
-    VkPipeline hello_triangle_pipeline;
-} cgvk_MainRenderPass;
+typedef struct cgvk_Frame {
+    uint32_t present_image_index;
+    VkFence fence;
+    VkSemaphore acquire_next_image_semaphore;
+    VkSemaphore execute_commands_semaphore;
+    VkCommandPool main_command_pool;
+} cgvk_Frame;
 
 typedef struct cgvk_Renderer {
     const cgvk_Device* dev;
     const cgvk_Swapchain* swp;
-    cgvk_FrameList frames;
-    cgvk_ImagePool* images;
-    cgvk_MainRenderPass rp;
+    uint64_t current_frame;
+    uint16_t frame_count;
+    VkRenderPass render_pass;
+    VkPipelineLayout empty_pipeline_layout;
+    VkPipeline hello_triangle_pipeline;
+    VkFramebuffer* framebuffers;
+    cgvk_TransientAllocator* talloc;
+    cgvk_Frame* frames;
 } cgvk_Renderer;
 
 // ============================================================================
@@ -196,6 +163,8 @@ static VkImageLayout cgvk_decode_image_layout(cgvk_ImageLayout l);
 
 static void cgvk_reset_transient_buffers(cgvk_TransientAllocator* talloc, uint32_t tag)
 {
+    VmaAllocator allocator = talloc->dev->allocator;
+
     cgvk_TransientBuffer* src = talloc->used_head;
     cgvk_TransientBuffer *head = NULL, *tail = NULL, *tmp;
     while (src) {
@@ -203,7 +172,7 @@ static void cgvk_reset_transient_buffers(cgvk_TransientAllocator* talloc, uint32
         src->next = NULL;
         if (src->tag == tag) {
             if (src->mapped) {
-                vmaUnmapMemory(talloc->dev->allocator, src->memory);
+                vmaUnmapMemory(allocator, src->memory);
                 src->mapped = NULL;
             }
             src->tag = 0;
@@ -224,13 +193,15 @@ static void cgvk_reset_transient_buffers(cgvk_TransientAllocator* talloc, uint32
 
 static void cgvk_submit_transient_buffers(cgvk_TransientAllocator* talloc)
 {
+    VmaAllocator allocator = talloc->dev->allocator;
+
     cgvk_TransientBuffer *cur = talloc->pending_head;
     while (cur) {
         if (cur->mapped) {
             if (!(cur->properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
-                vmaFlushAllocation(talloc->dev->allocator, cur->memory, 0, cur->used);
+                vmaFlushAllocation(allocator, cur->memory, 0, cur->used);
             }
-            vmaUnmapMemory(talloc->dev->allocator, cur->memory);
+            vmaUnmapMemory(allocator, cur->memory);
             cur->mapped = NULL;
         }
         cur = cur->next;
@@ -246,9 +217,11 @@ static void cgvk_submit_transient_buffers(cgvk_TransientAllocator* talloc)
     talloc->pending_tail = talloc->pending_head = NULL;
 }
 
-static void* cgvk_allocate_transient_block(cgvk_TransientAllocator* talloc, uint32_t tag, size_t size)
+static void cgvk_allocate_transient_block(cgvk_TransientAllocator* talloc, uint32_t tag, size_t size, cgvk_TransientBlock* block)
 {
     assert(size <= talloc->buffer_size);
+
+    VmaAllocator allocator = talloc->dev->allocator;
 
     cgvk_TransientBuffer *cur = talloc->pending_head;
     while (cur) {
@@ -290,14 +263,14 @@ static void* cgvk_allocate_transient_block(cgvk_TransientAllocator* talloc, uint
             };
 
             VmaAllocationInfo info;
-            VkResult result = vmaCreateBuffer(talloc->dev->allocator, &create_info, &alloc_info, &cur->buffer, &cur->memory, &info);
+            VkResult result = vmaCreateBuffer(allocator, &create_info, &alloc_info, &cur->buffer, &cur->memory, &info);
             if (result != VK_SUCCESS) {
                 log_fatal("vmaCreateBuffer failed: %d", (int)result);
                 abort();
             }
 
             uint32_t mem_type = info.memoryType;
-            vmaGetMemoryTypeProperties(talloc->dev->allocator, mem_type, &cur->properties);
+            vmaGetMemoryTypeProperties(allocator, mem_type, &cur->properties);
 
             cur->mapped = info.pMappedData;
         }
@@ -314,16 +287,19 @@ static void* cgvk_allocate_transient_block(cgvk_TransientAllocator* talloc, uint
     }
 
     if (!cur->mapped) {
-        VkResult result = vmaMapMemory(talloc->dev->allocator, cur->memory, &cur->mapped);
+        VkResult result = vmaMapMemory(allocator, cur->memory, &cur->mapped);
         if (result != VK_SUCCESS) {
             log_fatal("vmaMapMemory failed: %d", (int)result);
             abort();
         }
     }
 
-    void* addr = (uint8_t*)cur->mapped + cur->used;
+    block->buffer = cur->buffer;
+    block->offset = cur->used;
+    block->size = (uint32_t)size;
+    block->mapped = (uint8_t*)cur->mapped + cur->used;
+
     cur->used += (uint32_t)size;
-    return addr;
 }
 
 static cgvk_TransientAllocator* cgvk_new_transient_allocator(const cgvk_Device* dev, uint32_t buffer_size, uint16_t capacity)
@@ -348,90 +324,14 @@ static cgvk_TransientAllocator* cgvk_new_transient_allocator(const cgvk_Device* 
 
 static void cgvk_free_transient_allocator(cgvk_TransientAllocator* talloc)
 {
+    VmaAllocator allocator = talloc->dev->allocator;
+
     for (unsigned i = 0, n = talloc->count; i < n; ++i) {
         cgvk_TransientBuffer* tbuf = &talloc->buffers[i];
-        vmaDestroyBuffer(talloc->dev->allocator, tbuf->buffer, tbuf->memory);
+        vmaDestroyBuffer(allocator, tbuf->buffer, tbuf->memory);
     }
 
     free(talloc);
-}
-
-// ============================================================================
-
-static void cgvk_free_image(cgvk_Image* img)
-{
-    // TODO: free linked framebuffers
-
-    if (img->image_view)
-        vkDestroyImageView(img->dev->device, img->image_view, NULL);
-
-    if (img->memory)
-        vmaDestroyImage(img->dev->allocator, img->image, img->memory);
-
-    cgvk_ImagePool* pool = img->pool;
-
-    memset(img, 0, sizeof(cgvk_Image));
-    img->dev = NULL;
-    img->memory = VK_NULL_HANDLE;
-    img->image = VK_NULL_HANDLE;
-    img->image_view = VK_NULL_HANDLE;
-
-    if (pool) {
-        img->next = pool->free;
-        pool->free = img;
-    } else {
-        img->next = NULL;
-    }
-}
-
-static cgvk_Image* cgvk_allocate_image(cgvk_ImagePool* pool)
-{
-    cgvk_Image* img = NULL;
-
-    if (pool->free) {
-        img = pool->free;
-        pool->free = pool->free->next;
-    } else {
-        assert(pool->count < pool->capacity);
-        size_t id = pool->count++;
-        img = &pool->objects[id];
-    }
-
-    assert(img);
-
-    memset(img, 0, sizeof(cgvk_Image));
-    img->dev = pool->dev;
-    img->pool = pool;
-    img->memory = VK_NULL_HANDLE;
-    img->image = VK_NULL_HANDLE;
-    img->image_view = VK_NULL_HANDLE;
-
-    return img;
-}
-
-static cgvk_ImagePool* cgvk_new_image_pool(const cgvk_Device* dev, uint32_t capacity)
-{
-    size_t size = sizeof(cgvk_ImagePool) + sizeof(cgvk_Image) * capacity;
-
-    cgvk_ImagePool* pool = (cgvk_ImagePool*)malloc(size);
-
-    memset(pool, 0, sizeof(cgvk_ImagePool));
-    pool->dev = dev;
-    pool->capacity = capacity;
-
-    return pool;
-}
-
-static void cgvk_free_image_pool(cgvk_ImagePool* pool)
-{
-    for (unsigned i = 0, n = pool->count; i < n; ++i) {
-        if (!pool->objects[i].dev)
-            continue;
-        pool->objects[i].pool = NULL;
-        cgvk_free_image(&pool->objects[i]);
-    }
-
-    free(pool);
 }
 
 // ============================================================================
@@ -466,6 +366,8 @@ static cgvk_Shader* cgvk_get_shader_by_code(cgvk_ShaderCache* cache, size_t size
     cgvk_Shader* sh = NULL;
     HASH_FIND(hh, cache->head, &key, sizeof(XXH64_hash_t), sh);
 
+    VkDevice device = cache->dev->device;
+
     if (sh) {
         cgvk_touch_shader(cache, sh);
     } else {
@@ -478,7 +380,7 @@ static cgvk_Shader* cgvk_get_shader_by_code(cgvk_ShaderCache* cache, size_t size
             sh = cache->oldest;
             cache->oldest = cache->oldest->next;
             cache->oldest->prev = NULL;
-            vkDestroyShaderModule(cache->dev->device, sh->module, NULL);
+            vkDestroyShaderModule(device, sh->module, NULL);
         }
         
         memset(sh, 0, sizeof(cgvk_Shader));
@@ -499,7 +401,7 @@ static cgvk_Shader* cgvk_get_shader_by_code(cgvk_ShaderCache* cache, size_t size
             .pCode = (const uint32_t*)code,
         };
 
-        VkResult result = vkCreateShaderModule(cache->dev->device, &create_info, NULL, &sh->module);
+        VkResult result = vkCreateShaderModule(device, &create_info, NULL, &sh->module);
         if (result != VK_SUCCESS) {
             log_fatal("vkCreateShaderModule failed: %d", (int)result);
             abort();
@@ -527,9 +429,11 @@ static cgvk_ShaderCache* cgvk_new_shader_cache(const cgvk_Device* dev, uint32_t 
 
 static void cgvk_free_shader_cache(cgvk_ShaderCache* cache)
 {
+    VkDevice device = cache->dev->device;
+
     for (unsigned i = 0, n = cache->count; i < n; ++i) {
         if (cache->objects[i].module)
-            vkDestroyShaderModule(cache->dev->device, cache->objects[i].module, NULL);
+            vkDestroyShaderModule(device, cache->objects[i].module, NULL);
     }
 
     free(cache);
@@ -537,267 +441,276 @@ static void cgvk_free_shader_cache(cgvk_ShaderCache* cache)
 
 // ============================================================================
 
-static void cgvk_init_main_render_pass(const cgvk_Device* dev, const cgvk_Swapchain* swp, const cgvk_ImagePool* imgpool, cgvk_MainRenderPass* rp)
+static VkRenderPass cgvk_new_render_pass(const cgvk_Device* dev, const cgvk_Swapchain* swp)
 {
-    memset(rp, 0, sizeof(cgvk_MainRenderPass));
-    rp->dev = dev;
-    rp->swp = swp;
+    VkFormat present_format = cgvk_decode_format(swp->format);
 
-    // render pass
-    {
-        VkFormat present_format = cgvk_decode_format(swp->format);
-
-        uint32_t attachment_count = 1;
-        VkAttachmentDescription attachments[1] = {
-            {
-                .flags = 0,
-                .format = present_format,
-                .samples = VK_SAMPLE_COUNT_1_BIT,
-                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-                .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-                .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-                .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-                .finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-            },
-        };
-
-        uint32_t color_count = 1;
-        VkAttachmentReference color_refs[] = {
-            {
-                .attachment = 0,
-                .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            },
-        };
-
-        uint32_t subpass_count = 1;
-        VkSubpassDescription subpasses[1] = {
-            {
-                .flags = 0,
-                .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
-                .inputAttachmentCount = 0,
-                .pInputAttachments = NULL,
-                .colorAttachmentCount = color_count,
-                .pColorAttachments = color_refs,
-                .pResolveAttachments = NULL,
-                .pDepthStencilAttachment = NULL,
-                .preserveAttachmentCount = 0,
-                .pPreserveAttachments = NULL,
-            },
-        };
-
-        uint32_t dependency_count = 1;
-        VkSubpassDependency dependencies[1] = {
-            {
-                .srcSubpass = VK_SUBPASS_EXTERNAL,
-                .dstSubpass = 0,
-                .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                .srcAccessMask = 0,
-                .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-                .dependencyFlags = 0,
-            },
-        };
-
-        VkRenderPassCreateInfo create_info = {
-            .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-            .pNext = NULL,
+    uint32_t attachment_count = 1;
+    VkAttachmentDescription attachments[1] = {
+        {
             .flags = 0,
-            .attachmentCount = attachment_count,
-            .pAttachments = attachments,
-            .subpassCount = subpass_count,
-            .pSubpasses = subpasses,
-            .dependencyCount = dependency_count,
-            .pDependencies = dependencies,
-        };
+            .format = present_format,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        },
+    };
 
-        VkResult result = vkCreateRenderPass(dev->device, &create_info, NULL, &rp->render_pass);
-        if (result != VK_SUCCESS) {
-            log_fatal("vkCreateRenderPass failed");
-            abort();
-        }
+    uint32_t color_count = 1;
+    VkAttachmentReference color_refs[] = {
+        {
+            .attachment = 0,
+            .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        },
+    };
+
+    uint32_t subpass_count = 1;
+    VkSubpassDescription subpasses[1] = {
+        {
+            .flags = 0,
+            .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+            .inputAttachmentCount = 0,
+            .pInputAttachments = NULL,
+            .colorAttachmentCount = color_count,
+            .pColorAttachments = color_refs,
+            .pResolveAttachments = NULL,
+            .pDepthStencilAttachment = NULL,
+            .preserveAttachmentCount = 0,
+            .pPreserveAttachments = NULL,
+        },
+    };
+
+    uint32_t dependency_count = 1;
+    VkSubpassDependency dependencies[1] = {
+        {
+            .srcSubpass = VK_SUBPASS_EXTERNAL,
+            .dstSubpass = 0,
+            .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .srcAccessMask = 0,
+            .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dependencyFlags = 0,
+        },
+    };
+
+    VkRenderPassCreateInfo create_info = {
+        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+        .pNext = NULL,
+        .flags = 0,
+        .attachmentCount = attachment_count,
+        .pAttachments = attachments,
+        .subpassCount = subpass_count,
+        .pSubpasses = subpasses,
+        .dependencyCount = dependency_count,
+        .pDependencies = dependencies,
+    };
+
+    VkRenderPass render_pass;
+
+    VkResult result = vkCreateRenderPass(dev->device, &create_info, NULL, &render_pass);
+    if (result != VK_SUCCESS) {
+        log_fatal("vkCreateRenderPass failed");
+        abort();
     }
 
-    // pipeline layout
-    {
-        VkPipelineLayoutCreateInfo create_info = {
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-            .pNext = NULL,
-            .flags = 0,
-            .setLayoutCount = 0,
-            .pSetLayouts = NULL,
-            .pushConstantRangeCount = 0,
-            .pPushConstantRanges = NULL,
-        };
+    return render_pass;
+}
 
-        VkResult result = vkCreatePipelineLayout(dev->device, &create_info, NULL, &rp->empty_pipeline_layout);
-        if (result != VK_SUCCESS) {
-            log_fatal("vkCreatePipelineLayout failed: %d", (int)result);
-            abort();
-        }
+static VkPipelineLayout cgvk_new_empty_pipeline_layout(const cgvk_Device* dev)
+{
+    VkPipelineLayoutCreateInfo create_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .pNext = NULL,
+        .flags = 0,
+        .setLayoutCount = 0,
+        .pSetLayouts = NULL,
+        .pushConstantRangeCount = 0,
+        .pPushConstantRanges = NULL,
+    };
+
+    VkPipelineLayout pipeline_layout;
+
+    VkResult result = vkCreatePipelineLayout(dev->device, &create_info, NULL, &pipeline_layout);
+    if (result != VK_SUCCESS) {
+        log_fatal("vkCreatePipelineLayout failed: %d", (int)result);
+        abort();
     }
 
-    // pipeline
-    {
-        static const uint32_t vert_code[] = {
-            #include "triangle.vert.inc"
-        };
-        static const uint32_t frag_code[] = {
-            #include "triangle.frag.inc"
-        };
+    return pipeline_layout;
+}
 
-        cgvk_ShaderCache* cache = cgvk_new_shader_cache(rp->dev, 2);
+static VkPipeline cgvk_new_hello_triangle_pipeline(const cgvk_Device* dev, VkPipelineLayout pipeline_layout, VkRenderPass render_pass)
+{
+    static const uint32_t vert_code[] = {
+        #include "triangle.vert.inc"
+    };
+    static const uint32_t frag_code[] = {
+        #include "triangle.frag.inc"
+    };
 
-        cgvk_Shader* vs = cgvk_get_shader_by_code(cache, sizeof(vert_code), vert_code);
-        cgvk_Shader* fs = cgvk_get_shader_by_code(cache, sizeof(frag_code), frag_code);
+    cgvk_ShaderCache* cache = cgvk_new_shader_cache(dev, 2);
 
-        VkPipelineShaderStageCreateInfo stages[2] = {
-            {
-                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                .pNext = NULL,
-                .flags = 0,
-                .stage = VK_SHADER_STAGE_VERTEX_BIT,
-                .module = vs->module,
-                .pName = "main",
-                .pSpecializationInfo = NULL,
-            },
-            {
-                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                .pNext = NULL,
-                .flags = 0,
-                .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-                .module = fs->module,
-                .pName = "main",
-                .pSpecializationInfo = NULL,
-            },
-        };
+    cgvk_Shader* vs = cgvk_get_shader_by_code(cache, sizeof(vert_code), vert_code);
+    cgvk_Shader* fs = cgvk_get_shader_by_code(cache, sizeof(frag_code), frag_code);
 
-        VkPipelineVertexInputStateCreateInfo vi = {
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-            .pNext = NULL,
-            .vertexBindingDescriptionCount = 0,
-            .pVertexBindingDescriptions = NULL,
-            .vertexAttributeDescriptionCount = 0,
-            .pVertexAttributeDescriptions = NULL,
-        };
-
-        VkPipelineInputAssemblyStateCreateInfo ia = {
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-            .pNext = NULL,
-            .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
-            .primitiveRestartEnable = VK_FALSE,
-        };
-
-        VkPipelineViewportStateCreateInfo vps = {
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-            .pNext = NULL,
-            .viewportCount = 1,
-            .pViewports = NULL,
-            .scissorCount = 1,
-            .pScissors = NULL,
-        };
-
-        VkPipelineRasterizationStateCreateInfo rs = {
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-            .pNext = NULL,
-            .depthClampEnable = VK_FALSE,
-            .rasterizerDiscardEnable = VK_FALSE,
-            .polygonMode = VK_POLYGON_MODE_FILL,
-            .cullMode = VK_CULL_MODE_BACK_BIT,
-            .frontFace = VK_FRONT_FACE_CLOCKWISE,
-            .depthBiasEnable = VK_FALSE,
-            .lineWidth = 1.0f,
-        };
-
-        VkPipelineMultisampleStateCreateInfo ms = {
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-            .pNext = NULL,
-            .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
-            .sampleShadingEnable = VK_FALSE,
-            .pSampleMask = NULL,
-            .alphaToCoverageEnable = VK_FALSE,
-            .alphaToOneEnable = VK_FALSE,
-        };
-
-        VkPipelineDepthStencilStateCreateInfo dss = {
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-            .pNext = NULL,
-            .depthTestEnable = VK_FALSE,
-            .depthWriteEnable = VK_FALSE,
-            .depthBoundsTestEnable = VK_FALSE,
-            .stencilTestEnable = VK_FALSE,
-        };
-
-        VkPipelineColorBlendAttachmentState bas[] = {
-            {
-                .blendEnable = VK_FALSE,
-                .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
-            },
-        };
-
-        VkPipelineColorBlendStateCreateInfo bs = {
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-            .pNext = NULL,
-            .logicOpEnable = VK_FALSE,
-            .attachmentCount = 1,
-            .pAttachments = bas,
-        };
-
-        VkDynamicState dyss[] = {
-            VK_DYNAMIC_STATE_VIEWPORT,
-            VK_DYNAMIC_STATE_SCISSOR,
-        };
-
-        VkPipelineDynamicStateCreateInfo dys = {
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-            .pNext = NULL,
-            .dynamicStateCount = 2,
-            .pDynamicStates = dyss,
-        };
-
-        VkGraphicsPipelineCreateInfo create_info = {
-            .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
             .pNext = NULL,
             .flags = 0,
-            .stageCount = 2,
-            .pStages = stages,
-            .pVertexInputState = &vi,
-            .pInputAssemblyState = &ia,
-            .pTessellationState = NULL,
-            .pViewportState = &vps,
-            .pRasterizationState = &rs,
-            .pMultisampleState = &ms,
-            .pDepthStencilState = &dss,
-            .pColorBlendState = &bs,
-            .pDynamicState = &dys,
-            .layout = rp->empty_pipeline_layout,
-            .renderPass = rp->render_pass,
-            .subpass = 0,
-            .basePipelineHandle = VK_NULL_HANDLE,
-            .basePipelineIndex = 0,
-        };
+            .stage = VK_SHADER_STAGE_VERTEX_BIT,
+            .module = vs->module,
+            .pName = "main",
+            .pSpecializationInfo = NULL,
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .pNext = NULL,
+            .flags = 0,
+            .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .module = fs->module,
+            .pName = "main",
+            .pSpecializationInfo = NULL,
+        },
+    };
 
-        VkResult result = vkCreateGraphicsPipelines(rp->dev->device, VK_NULL_HANDLE, 1, &create_info, NULL, &rp->hello_triangle_pipeline);
-        if (result != VK_SUCCESS) {
-            log_fatal("vkCreateGraphicsPipelines failed: %d", (int)result);
-            abort();
-        }
+    VkPipelineVertexInputStateCreateInfo vi = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .pNext = NULL,
+        .vertexBindingDescriptionCount = 0,
+        .pVertexBindingDescriptions = NULL,
+        .vertexAttributeDescriptionCount = 0,
+        .pVertexAttributeDescriptions = NULL,
+    };
 
-        cgvk_free_shader_cache(cache);
+    VkPipelineInputAssemblyStateCreateInfo ia = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .pNext = NULL,
+        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+        .primitiveRestartEnable = VK_FALSE,
+    };
+
+    VkPipelineViewportStateCreateInfo vps = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .pNext = NULL,
+        .viewportCount = 1,
+        .pViewports = NULL,
+        .scissorCount = 1,
+        .pScissors = NULL,
+    };
+
+    VkPipelineRasterizationStateCreateInfo rs = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .pNext = NULL,
+        .depthClampEnable = VK_FALSE,
+        .rasterizerDiscardEnable = VK_FALSE,
+        .polygonMode = VK_POLYGON_MODE_FILL,
+        .cullMode = VK_CULL_MODE_BACK_BIT,
+        .frontFace = VK_FRONT_FACE_CLOCKWISE,
+        .depthBiasEnable = VK_FALSE,
+        .lineWidth = 1.0f,
+    };
+
+    VkPipelineMultisampleStateCreateInfo ms = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .pNext = NULL,
+        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+        .sampleShadingEnable = VK_FALSE,
+        .pSampleMask = NULL,
+        .alphaToCoverageEnable = VK_FALSE,
+        .alphaToOneEnable = VK_FALSE,
+    };
+
+    VkPipelineDepthStencilStateCreateInfo dss = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .pNext = NULL,
+        .depthTestEnable = VK_FALSE,
+        .depthWriteEnable = VK_FALSE,
+        .depthBoundsTestEnable = VK_FALSE,
+        .stencilTestEnable = VK_FALSE,
+    };
+
+    VkPipelineColorBlendAttachmentState bas[] = {
+        {
+            .blendEnable = VK_FALSE,
+            .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+        },
+    };
+
+    VkPipelineColorBlendStateCreateInfo bs = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .pNext = NULL,
+        .logicOpEnable = VK_FALSE,
+        .attachmentCount = 1,
+        .pAttachments = bas,
+    };
+
+    VkDynamicState dyss[] = {
+        VK_DYNAMIC_STATE_VIEWPORT,
+        VK_DYNAMIC_STATE_SCISSOR,
+    };
+
+    VkPipelineDynamicStateCreateInfo dys = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .pNext = NULL,
+        .dynamicStateCount = 2,
+        .pDynamicStates = dyss,
+    };
+
+    VkGraphicsPipelineCreateInfo create_info = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .pNext = NULL,
+        .flags = 0,
+        .stageCount = 2,
+        .pStages = stages,
+        .pVertexInputState = &vi,
+        .pInputAssemblyState = &ia,
+        .pTessellationState = NULL,
+        .pViewportState = &vps,
+        .pRasterizationState = &rs,
+        .pMultisampleState = &ms,
+        .pDepthStencilState = &dss,
+        .pColorBlendState = &bs,
+        .pDynamicState = &dys,
+        .layout = pipeline_layout,
+        .renderPass = render_pass,
+        .subpass = 0,
+        .basePipelineHandle = VK_NULL_HANDLE,
+        .basePipelineIndex = 0,
+    };
+
+    VkPipeline pipeline;
+
+    VkResult result = vkCreateGraphicsPipelines(dev->device, VK_NULL_HANDLE, 1, &create_info, NULL, &pipeline);
+    if (result != VK_SUCCESS) {
+        log_fatal("vkCreateGraphicsPipelines failed: %d", (int)result);
+        abort();
     }
 
-    // framebuffers
+    cgvk_free_shader_cache(cache);
+
+    return pipeline;
+}
+
+static VkFramebuffer* cgvk_new_framebuffers(const cgvk_Device* dev, const cgvk_Swapchain* swp, VkRenderPass render_pass)
+{
+    VkFramebuffer* framebuffers = (VkFramebuffer*)malloc(sizeof(VkFramebuffer) * swp->image_count);
+
     for (int i = 0, n = swp->image_count; i < n; ++i) {
         uint32_t attachment_count = 1;
         VkImageView attachments[1] = {
-            swp->images[i]->image_view,
+            swp->images[i].image_view,
         };
 
         VkFramebufferCreateInfo create_info = {
             .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
             .pNext = NULL,
             .flags = 0,
-            .renderPass = rp->render_pass,
+            .renderPass = render_pass,
             .attachmentCount = attachment_count,
             .pAttachments = attachments,
             .width = swp->width,
@@ -805,145 +718,233 @@ static void cgvk_init_main_render_pass(const cgvk_Device* dev, const cgvk_Swapch
             .layers = 1,
         };
 
-        VkResult result = vkCreateFramebuffer(dev->device, &create_info, NULL, &rp->framebuffers[i]);
+        VkResult result = vkCreateFramebuffer(dev->device, &create_info, NULL, &framebuffers[i]);
         if (result != VK_SUCCESS) {
             log_fatal("vkCreateFramebuffer failed: %d", (int)result);
             abort();
         }
     }
+
+    return framebuffers;
 }
 
-static void cgvk_kill_main_render_pass(cgvk_MainRenderPass* rp)
+static cgvk_Frame* cgvk_new_frames(const cgvk_Device* dev, uint32_t frame_count)
 {
-    for (int i = 0; i < CGVK_MAX_SWAPCHAIN_IMAGE_COUNT; ++i) {
-        if (rp->framebuffers[i])
-            vkDestroyFramebuffer(rp->dev->device, rp->framebuffers[i], NULL);
+    cgvk_Frame* frames = (cgvk_Frame*)malloc(sizeof(cgvk_Frame) * frame_count);
+    memset(frames, 0, sizeof(cgvk_Frame) * frame_count);
+
+    for (unsigned i = 0, n = frame_count; i < n; ++i) {
+        frames[i].present_image_index = UINT32_MAX;
     }
 
-    if (rp->hello_triangle_pipeline)
-        vkDestroyPipeline(rp->dev->device, rp->hello_triangle_pipeline, NULL);
+    // Fences
+    {
+        VkFenceCreateInfo create_info = {
+            .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+            .pNext = NULL,
+            .flags = VK_FENCE_CREATE_SIGNALED_BIT,
+        };
+        
+        for (unsigned i = 0, n = frame_count; i < n; ++i) {
+            VkResult result = vkCreateFence(dev->device, &create_info, NULL, &frames[i].fence);
+            if (result != VK_SUCCESS) {
+                log_fatal("vkCreateFence failed: %d", (int)result);
+                abort();
+            }
+        }
+    }
 
-    if (rp->empty_pipeline_layout)
-        vkDestroyPipelineLayout(rp->dev->device, rp->empty_pipeline_layout, NULL);
-
-    if (rp->render_pass)
-        vkDestroyRenderPass(rp->dev->device, rp->render_pass, NULL);
-
-    memset(rp, 0, sizeof(cgvk_MainRenderPass));
-}
-
-// ============================================================================
-
-static VkSemaphore cgvk_allocate_semaphore(cgvk_SemaphorePool* pool)
-{
-    if (pool->used_count < pool->total_count) {
-        return pool->semaphores[pool->used_count++];
-    } else {
-        assert(pool->used_count == pool->total_count);
-        assert(pool->total_count < pool->capacity);
+    // Semaphores
+    {
         VkSemaphoreCreateInfo create_info = {
             .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
             .pNext = NULL,
             .flags = 0,
         };
-        VkSemaphore semaphore;
-        VkResult result = vkCreateSemaphore(pool->device, &create_info, NULL, &semaphore);
-        if (result != VK_SUCCESS) {
-            log_fatal("vkCreateSemaphore failed: %d", (int)result);
-            abort();
+
+        for (unsigned i = 0, n = frame_count; i < n; ++i) {
+            VkResult result;
+            result = vkCreateSemaphore(dev->device, &create_info, NULL, &frames[i].acquire_next_image_semaphore);
+            if (result != VK_SUCCESS) {
+                log_fatal("vkCreateSemaphore failed: %d", (int)result);
+                abort();
+            }
+            result = vkCreateSemaphore(dev->device, &create_info, NULL, &frames[i].execute_commands_semaphore);
+            if (result != VK_SUCCESS) {
+                log_fatal("vkCreateSemaphore failed: %d", (int)result);
+                abort();
+            }
         }
-        pool->semaphores[pool->total_count++] = semaphore;
-        pool->used_count = pool->total_count;
-        return semaphore;
-    }
-}
-
-static void cgvk_reset_semaphore_pool(cgvk_SemaphorePool* pool)
-{
-    pool->used_count = 0;
-}
-
-static cgvk_SemaphorePool* cgvk_new_semaphore_pool(const cgvk_Device* dev, uint16_t capacity)
-{
-    size_t size = sizeof(cgvk_SemaphorePool) + sizeof(VkSemaphore) * capacity;
-
-    cgvk_SemaphorePool* pool = (cgvk_SemaphorePool*)malloc(size);
-
-    memset(pool, 0, size);
-    pool->device = dev->device;
-    pool->capacity = capacity;
-
-    return pool;
-}
-
-static void cgvk_free_semaphore_pool(cgvk_SemaphorePool* pool)
-{
-    for (int i = 0, n = pool->total_count; i < n; ++i) {
-        vkDestroySemaphore(pool->device, pool->semaphores[i], NULL);
     }
 
-    free(pool);
+    // Command Pools
+    {
+        VkCommandPoolCreateInfo create_info = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .pNext = NULL,
+            .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+            .queueFamilyIndex = dev->main_queue_family,
+        };
+        for (unsigned i = 0, n = frame_count; i < n; ++i) {
+            VkResult result = vkCreateCommandPool(dev->device, &create_info, NULL, &frames[i].main_command_pool);
+            if (result != VK_SUCCESS) {
+                log_fatal("vkCreateCommandPool failed: %d", (int)result);
+                abort();
+            }
+        }
+    }
+
+    return frames;
+}
+
+static cgvk_Renderer* cgvk_new_renderer(const cgvk_Device* dev, const cgvk_Swapchain* swp)
+{
+    cgvk_Renderer* rnd = (cgvk_Renderer*)malloc(sizeof(cgvk_Renderer));
+    memset(rnd, 0, sizeof(cgvk_Renderer));
+    rnd->dev = dev;
+    rnd->swp = swp;
+
+    // TODO: customize
+    rnd->frame_count = 3;
+
+    rnd->render_pass = cgvk_new_render_pass(dev, swp);
+    rnd->empty_pipeline_layout = cgvk_new_empty_pipeline_layout(dev);
+    rnd->hello_triangle_pipeline = cgvk_new_hello_triangle_pipeline(dev, rnd->empty_pipeline_layout, rnd->render_pass);
+    rnd->framebuffers = cgvk_new_framebuffers(dev, swp, rnd->render_pass);
+    rnd->talloc = cgvk_new_transient_allocator(dev, 1024 * 1024 * 2, 16);
+    rnd->frames = cgvk_new_frames(dev, rnd->frame_count);
+
+    return rnd;
+}
+
+static void cgvk_free_renderer(cgvk_Renderer* rnd)
+{
+    VkDevice device = rnd->dev->device;
+
+    vkDestroyPipeline(device, rnd->hello_triangle_pipeline, NULL);
+    vkDestroyPipelineLayout(device, rnd->empty_pipeline_layout, NULL);
+
+    for (unsigned i = 0, n = rnd->swp->image_count; i < n; ++i) {
+        vkDestroyFramebuffer(device, rnd->framebuffers[i], NULL);
+    }
+
+    vkDestroyRenderPass(device, rnd->render_pass, NULL);
+
+    for (unsigned i = 0, n = rnd->frame_count; i < n; ++i) {
+        vkDestroySemaphore(device, rnd->frames[i].acquire_next_image_semaphore, NULL);
+        vkDestroySemaphore(device, rnd->frames[i].execute_commands_semaphore, NULL);
+        vkDestroyFence(device, rnd->frames[i].fence, NULL);
+        vkDestroyCommandPool(device, rnd->frames[i].main_command_pool, NULL);
+    }
+
+    free(rnd->framebuffers);
+    free(rnd->talloc);
+    free(rnd->frames);
+    free(rnd);
 }
 
 // ============================================================================
 
-static void cgvk_begin_frame(cgvk_FrameList* fl)
+static inline size_t cgvk_get_current_frame_index(cgvk_Renderer* rnd)
 {
-    const size_t fidx = fl->frame_counter % CGVK_FRAME_LAG;
+    return rnd->current_frame % rnd->frame_count;
+}
 
-    uint32_t image_index = UINT32_MAX;
-    VkSemaphore semaphore = cgvk_allocate_semaphore(fl->semaphores[fidx]);
-    VkResult result = vkAcquireNextImageKHR(fl->dev->device, fl->swp->swapchain, UINT64_MAX, semaphore, VK_NULL_HANDLE, &image_index);
+static void cgvk_advance_next_frame(cgvk_Renderer* rnd)
+{
+    assert(rnd->current_frame < UINT64_MAX);
+    rnd->current_frame++;
+}
+
+static void cgvk_acquire_swapchain_image(cgvk_Renderer* rnd, size_t fidx)
+{
+    VkResult result = vkAcquireNextImageKHR(rnd->dev->device, rnd->swp->swapchain, UINT64_MAX, rnd->frames[fidx].acquire_next_image_semaphore, VK_NULL_HANDLE, &rnd->frames[fidx].present_image_index);
     if (result != VK_SUCCESS) {
         log_fatal("vkAcquireNextImageKHR failed: %d", (int)result);
         abort();
     }
-    assert(image_index < UINT8_MAX);
-    fl->present_image_indices[fidx] = (uint8_t)image_index;
-    fl->acquire_next_image_semaphores[fidx] = semaphore;
 }
 
-static void cgvk_render_frame(cgvk_Renderer* rnd)
+static VkCommandBuffer cgvk_begin_main_command_buffer(cgvk_Renderer* rnd, size_t fidx)
 {
-    const size_t fidx = rnd->frames.frame_counter % CGVK_FRAME_LAG;
+    VkResult result;
+    VkCommandBuffer cmdbuf;
 
-    VkCommandBuffer main_cmdbuf;
+    VkCommandBufferAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .pNext = NULL,
+        .commandPool = rnd->frames[fidx].main_command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
 
-    // allocate main command buffer
-    {
-        VkCommandBufferAllocateInfo alloc_info = {
-            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-            .pNext = NULL,
-            .commandPool = rnd->frames.main_command_pools[fidx],
-            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-            .commandBufferCount = 1,
-        };
-
-        VkResult result = vkAllocateCommandBuffers(rnd->dev->device, &alloc_info, &main_cmdbuf);
-        if (result != VK_SUCCESS) {
-            log_fatal("vkAllocateCommandBuffers failed: %d", (int)result);
-            abort();
-        }
+    result = vkAllocateCommandBuffers(rnd->dev->device, &alloc_info, &cmdbuf);
+    if (result != VK_SUCCESS) {
+        log_fatal("vkAllocateCommandBuffers failed: %d", (int)result);
+        abort();
     }
 
-    // begin recording main commands
-    {
-        VkCommandBufferBeginInfo begin_info = {
-            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-            .pNext = NULL,
-            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-            .pInheritanceInfo = NULL,
-        };
+    VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .pNext = NULL,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        .pInheritanceInfo = NULL,
+    };
 
-        VkResult result = vkBeginCommandBuffer(main_cmdbuf, &begin_info);
-        if (result != VK_SUCCESS) {
-            log_fatal("vkBeginCommandBuffer failed: %d", (int)result);
-            abort();
-        }
+    result = vkBeginCommandBuffer(cmdbuf, &begin_info);
+    if (result != VK_SUCCESS) {
+        log_fatal("vkBeginCommandBuffer failed: %d", (int)result);
+        abort();
     }
 
-    // ======== Main Render Pass ========
+    return cmdbuf;
+}
 
+static void cgvk_end_main_command_buffer(cgvk_Renderer* rnd, size_t fidx, VkCommandBuffer cmdbuf)
+{
+    VkResult result;
+
+    result = vkEndCommandBuffer(cmdbuf);
+    if (result != VK_SUCCESS) {
+        log_fatal("vkEndCommandBuffer failed: %d", (int)result);
+        abort();
+    }
+
+    result = vkResetFences(rnd->dev->device, 1, &rnd->frames[fidx].fence);
+    if (result != VK_SUCCESS) {
+        log_fatal("vkResetFences failed: %d", (int)result);
+        abort();
+    }
+
+    uint32_t wait_semaphore_count = 1;
+    VkSemaphore wait_semaphores[1] = {
+        rnd->frames[fidx].acquire_next_image_semaphore,
+    };
+    VkPipelineStageFlags wait_dststages[1] = {
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+    };
+
+    VkSubmitInfo submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .pNext = NULL,
+        .waitSemaphoreCount = wait_semaphore_count,
+        .pWaitSemaphores = wait_semaphores,
+        .pWaitDstStageMask = wait_dststages,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cmdbuf,
+        .signalSemaphoreCount = 1,
+        .pSignalSemaphores = &rnd->frames[fidx].execute_commands_semaphore,
+    };
+
+    result = vkQueueSubmit(rnd->dev->main_queue, 1, &submit_info, rnd->frames[fidx].fence);
+    if (result != VK_SUCCESS) {
+        log_fatal("vkQueueSubmit failed: %d", (int)result);
+        abort();
+    }
+}
+
+static void cgvk_begin_render_pass(cgvk_Renderer* rnd, size_t fidx, VkCommandBuffer cmdbuf)
+{
     uint32_t clear_value_count = 1;
     VkClearValue clear_values[1] = {
         {
@@ -956,8 +957,8 @@ static void cgvk_render_frame(cgvk_Renderer* rnd)
     VkRenderPassBeginInfo main_rp_begin = {
         .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
         .pNext = NULL,
-        .renderPass = rnd->rp.render_pass,
-        .framebuffer = rnd->rp.framebuffers[rnd->frames.present_image_indices[fidx]],
+        .renderPass = rnd->render_pass,
+        .framebuffer = rnd->framebuffers[rnd->frames[fidx].present_image_index],
         .renderArea = {
             .offset = { 0, 0 },
             .extent = { rnd->swp->width, rnd->swp->height },
@@ -966,206 +967,118 @@ static void cgvk_render_frame(cgvk_Renderer* rnd)
         .pClearValues = clear_values,
     };
 
-    vkCmdBeginRenderPass(main_cmdbuf, &main_rp_begin, VK_SUBPASS_CONTENTS_INLINE);
-
-    {
-        VkViewport viewports[] = {
-            {
-                .x = 0.0f,
-                .y = 0.0f,
-                .width = (float)rnd->swp->width,
-                .height = (float)rnd->swp->height,
-                .minDepth = 0.0f,
-                .maxDepth = 1.0f,
-            },
-        };
-        VkRect2D scissors[] = {
-            {
-                .offset = { 0, 0 },
-                .extent = { rnd->swp->width, rnd->swp->height },
-            },
-        };
-
-        vkCmdBindPipeline(main_cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, rnd->rp.hello_triangle_pipeline);
-        vkCmdSetViewport(main_cmdbuf, 0, 1, viewports);
-        vkCmdSetScissor(main_cmdbuf, 0, 1, scissors);
-        vkCmdDraw(main_cmdbuf, 3, 1, 0, 0);
-    }
-
-    vkCmdEndRenderPass(main_cmdbuf);
-
-    // ======== Finish Rendering ========
-
-    // end recording main commands
-    {
-        VkResult result = vkEndCommandBuffer(main_cmdbuf);
-        if (result != VK_SUCCESS) {
-            log_fatal("vkEndCommandBuffer failed: %d", (int)result);
-            abort();
-        }
-    }
-
-    // reset fence
-    {
-        VkResult result = vkResetFences(rnd->dev->device, 1, &rnd->frames.fences[fidx]);
-        if (result != VK_SUCCESS) {
-            log_fatal("vkResetFences failed: %d", (int)result);
-            abort();
-        }
-    }
-
-    // submit main command buffer
-    {
-        VkSemaphore semaphore = cgvk_allocate_semaphore(rnd->frames.semaphores[fidx]);
-        rnd->frames.render_frame_semaphores[fidx] = semaphore;
-
-        uint32_t wait_semaphore_count = 1;
-        VkSemaphore wait_semaphores[1] = {
-            rnd->frames.acquire_next_image_semaphores[fidx],
-        };
-        VkPipelineStageFlags wait_dststages[1] = {
-            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-        };
-
-        VkSubmitInfo submit_info = {
-            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-            .pNext = NULL,
-            .waitSemaphoreCount = wait_semaphore_count,
-            .pWaitSemaphores = wait_semaphores,
-            .pWaitDstStageMask = wait_dststages,
-            .commandBufferCount = 1,
-            .pCommandBuffers = &main_cmdbuf,
-            .signalSemaphoreCount = 1,
-            .pSignalSemaphores = &semaphore,
-        };
-
-        VkResult result = vkQueueSubmit(rnd->dev->main_queue, 1, &submit_info, rnd->frames.fences[fidx]);
-        if (result != VK_SUCCESS) {
-            log_fatal("vkQueueSubmit failed: %d", (int)result);
-            abort();
-        }
-
-        
-    }
+    vkCmdBeginRenderPass(cmdbuf, &main_rp_begin, VK_SUBPASS_CONTENTS_INLINE);
 }
 
-static void cgvk_end_frame(cgvk_FrameList* fl)
+static void cgvk_end_render_pass(cgvk_Renderer* rnd, size_t fidx, VkCommandBuffer cmdbuf)
 {
-    size_t fidx = fl->frame_counter % CGVK_FRAME_LAG;
+    (void)rnd;
+    (void)fidx;
 
-    // Submit the final image to present
-    {
-        uint32_t wait_semaphore_count = 1;
-        VkSemaphore wait_semaphores[] = {
-            fl->render_frame_semaphores[fidx]
-        };
-        uint32_t image_index = fl->present_image_indices[fidx];
-
-        VkPresentInfoKHR present_info = {
-            .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-            .pNext = NULL,
-            .waitSemaphoreCount = wait_semaphore_count,
-            .pWaitSemaphores = wait_semaphores,
-            .swapchainCount = 1,
-            .pSwapchains = &fl->swp->swapchain,
-            .pImageIndices = &image_index,
-            .pResults = NULL,
-        };
-
-        VkResult result = vkQueuePresentKHR(fl->dev->present_queue, &present_info);
-        if (result != VK_SUCCESS) {
-            log_fatal("vkQueuePresentKHR failed: %d", (int)result);
-            abort();
-        }
-    }
-
-    // clear cached data
-    fl->acquire_next_image_semaphores[fidx] = VK_NULL_HANDLE;
-    fl->render_frame_semaphores[fidx] = VK_NULL_HANDLE;
-    fl->present_image_indices[fidx] = UINT8_MAX;
-
-    // ================ NEXT FRAME ==================
-
-    assert(fl->frame_counter < UINT64_MAX);
-    fl->frame_counter++;
-    fidx = fl->frame_counter % CGVK_FRAME_LAG;
-
-    // wait for the completion
-    {
-        VkResult result = vkWaitForFences(fl->dev->device, 1, &fl->fences[fidx], VK_TRUE, UINT64_MAX);
-        if (result != VK_SUCCESS) {
-            log_fatal("vkWaitForFences failed: %d", (int)result);
-            abort();
-        }
-    }
-
-    // reset the frame context
-    {
-        cgvk_reset_semaphore_pool(fl->semaphores[fidx]);
-
-        VkResult result = vkResetCommandPool(fl->dev->device, fl->main_command_pools[fidx], 0);
-        if (result != VK_SUCCESS) {
-            log_fatal("vkResetCommandPool failed: %d", (int)result);
-            abort();
-        }
-    }
+    vkCmdEndRenderPass(cmdbuf);
 }
 
-static void cgvk_init_frame_list(const cgvk_Device* dev, const cgvk_Swapchain* swp, cgvk_FrameList* fl)
+static void cgvk_set_viewport_and_scissor(cgvk_Renderer* rnd, size_t fidx, VkCommandBuffer cmdbuf)
 {
-    memset(fl, 0, sizeof(cgvk_FrameList));
-    fl->dev = dev;
-    fl->swp = swp;
+    (void)fidx;
 
-    for (int i = 0; i < CGVK_FRAME_LAG; ++i)
-        fl->semaphores[i] = cgvk_new_semaphore_pool(dev, 16);
+    VkViewport viewports[] = {
+        {
+            .x = 0.0f,
+            .y = 0.0f,
+            .width = (float)rnd->swp->width,
+            .height = (float)rnd->swp->height,
+            .minDepth = 0.0f,
+            .maxDepth = 1.0f,
+        },
+    };
+    VkRect2D scissors[] = {
+        {
+            .offset = { 0, 0 },
+            .extent = { rnd->swp->width, rnd->swp->height },
+        },
+    };
+
+    vkCmdSetViewport(cmdbuf, 0, 1, viewports);
+    vkCmdSetScissor(cmdbuf, 0, 1, scissors);
+}
+
+static void cgvk_draw_frame(cgvk_Renderer* rnd, size_t fidx)
+{
+    VkCommandBuffer cmdbuf = cgvk_begin_main_command_buffer(rnd, fidx);
+    cgvk_begin_render_pass(rnd, fidx, cmdbuf);
+
+    vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, rnd->hello_triangle_pipeline);
+    cgvk_set_viewport_and_scissor(rnd, fidx, cmdbuf);
+    vkCmdDraw(cmdbuf, 3, 1, 0, 0);
+
+    cgvk_end_render_pass(rnd, fidx, cmdbuf);
+    cgvk_end_main_command_buffer(rnd, fidx, cmdbuf);
+}
+
+static void cgvk_present_frame(cgvk_Renderer* rnd, size_t fidx)
+{
+    uint32_t wait_semaphore_count = 1;
+    VkSemaphore wait_semaphores[] = {
+        rnd->frames[fidx].execute_commands_semaphore,
+    };
     
-    // fences
-    {
-        VkFenceCreateInfo create_info = {
-        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-        .pNext = NULL,
-        .flags = VK_FENCE_CREATE_SIGNALED_BIT,
-        };
-        for (int i = 0; i < CGVK_FRAME_LAG; ++i) {
-            VkResult result = vkCreateFence(dev->device, &create_info, NULL, &fl->fences[i]);
-            if (result != VK_SUCCESS) {
-                log_fatal("vkCreateFence failed: %d", (int)result);
-                abort();
-            }
-        }
-    }
+    uint32_t image_index = rnd->frames[fidx].present_image_index;
 
-    // command pools
-    {
-        VkCommandPoolCreateInfo create_info = {
-            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-            .pNext = NULL,
-            .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
-            .queueFamilyIndex = dev->main_queue_family,
-        };
-        for (int i = 0; i < CGVK_FRAME_LAG; ++i) {
-            VkResult result = vkCreateCommandPool(dev->device, &create_info, NULL, &fl->main_command_pools[i]);
-            if (result != VK_SUCCESS) {
-                log_fatal("vkCreateCommandPool failed: %d", (int)result);
-                abort();
-            }
-        }
+    VkPresentInfoKHR present_info = {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+        .pNext = NULL,
+        .waitSemaphoreCount = wait_semaphore_count,
+        .pWaitSemaphores = wait_semaphores,
+        .swapchainCount = 1,
+        .pSwapchains = &rnd->swp->swapchain,
+        .pImageIndices = &image_index,
+        .pResults = NULL,
+    };
+
+    VkResult result = vkQueuePresentKHR(rnd->dev->present_queue, &present_info);
+    if (result != VK_SUCCESS) {
+        log_fatal("vkQueuePresentKHR failed: %d", (int)result);
+        abort();
     }
 }
 
-static void cgvk_kill_frame_list(cgvk_FrameList* fl)
+static void cgvk_wait_frame(cgvk_Renderer* rnd, size_t fidx)
 {
-    for (int i = 0; i < CGVK_FRAME_LAG; ++i)
-        cgvk_free_semaphore_pool(fl->semaphores[i]);
+    VkResult result = vkWaitForFences(rnd->dev->device, 1, &rnd->frames[fidx].fence, VK_TRUE, UINT64_MAX);
+    if (result != VK_SUCCESS) {
+        log_fatal("vkWaitForFences failed: %d", (int)result);
+        abort();
+    }
+}
 
-    for (int i = 0; i < CGVK_FRAME_LAG; ++i)
-        vkDestroyFence(fl->dev->device, fl->fences[i], NULL);
+static void cgvk_reset_frame(cgvk_Renderer* rnd, size_t fidx)
+{
+    VkResult result;
+    VkDevice device = rnd->dev->device;
 
-    for (int i = 0; i < CGVK_FRAME_LAG; ++i)
-        vkDestroyCommandPool(fl->dev->device, fl->main_command_pools[i], NULL);
+    result = vkResetCommandPool(device, rnd->frames[fidx].main_command_pool, 0);
+    if (result != VK_SUCCESS) {
+        log_fatal("vkResetCommandPool failed: %d", (int)result);
+        abort();
+    }
 
-    memset(fl, 0, sizeof(cgvk_FrameList));
+    rnd->frames[fidx].present_image_index = UINT32_MAX;
+}
+
+static void cgvk_render_frame(cgvk_Renderer* rnd)
+{
+    size_t fidx = cgvk_get_current_frame_index(rnd);
+
+    cgvk_acquire_swapchain_image(rnd, fidx);
+    cgvk_draw_frame(rnd, fidx);
+    cgvk_present_frame(rnd, fidx);
+
+    cgvk_advance_next_frame(rnd);
+
+    fidx = cgvk_get_current_frame_index(rnd);
+    cgvk_wait_frame(rnd, fidx);
+    cgvk_reset_frame(rnd, fidx);
 }
 
 // ============================================================================
@@ -1290,12 +1203,11 @@ static void cgvk_choose_surface_format(
     *found_colorspace = colorspace;
 }
 
-static void cgvk_init_swapchain(const cgvk_Device* dev, cgvk_ImagePool* imgpool, cgvk_Swapchain* swp)
+static cgvk_Swapchain* cgvk_new_swapchain(const cgvk_Device* dev)
 {
     VkResult result;
 
-    memset(swp, 0, sizeof(cgvk_Swapchain));
-
+    VkDevice device = dev->device;
     VkSurfaceKHR surface = cgvk_get_surface();
 
     // Query surface capabilites
@@ -1307,6 +1219,7 @@ static void cgvk_init_swapchain(const cgvk_Device* dev, cgvk_ImagePool* imgpool,
     }
 
     // Select image count
+    // TODO: customize image count
     uint32_t image_count = 3;
     if (image_count < caps.minImageCount)
         image_count = caps.minImageCount;
@@ -1349,39 +1262,53 @@ static void cgvk_init_swapchain(const cgvk_Device* dev, cgvk_ImagePool* imgpool,
         .oldSwapchain = VK_NULL_HANDLE,
     };
     VkSwapchainKHR swapchain;
-    result = vkCreateSwapchainKHR(dev->device, &create_info, NULL, &swapchain);
+    result = vkCreateSwapchainKHR(device, &create_info, NULL, &swapchain);
     if (result != VK_SUCCESS) {
         log_fatal("vkCreateSwapchainKHR failed: %d", (int)result);
         abort();
     }
 
     // Get actual image count
-    result = vkGetSwapchainImagesKHR(dev->device, swapchain, &image_count, NULL);
+    result = vkGetSwapchainImagesKHR(device, swapchain, &image_count, NULL);
     if (result != VK_SUCCESS) {
         log_fatal("vkGetSwapchainImagesKHR failed: %d", (int)result);
         abort();
     }
-    if (image_count > CGVK_MAX_SWAPCHAIN_IMAGE_COUNT) {
-        log_fatal("The number of the images of the swapchain exceeds the limit: %u > %u", image_count, CGVK_MAX_SWAPCHAIN_IMAGE_COUNT);
-        abort();
-    }
+
+    assert(extent.width < UINT16_MAX);
+    assert(extent.height < UINT16_MAX);
+
+    size_t size = sizeof(cgvk_Swapchain) + sizeof(cgvk_SwapchainImage) * image_count;
+
+    cgvk_Swapchain* swp = (cgvk_Swapchain*)malloc(size);
+    memset(swp, 0, sizeof(cgvk_Swapchain));
+
+    // Fill the fields
+    swp->dev = dev;
+    swp->swapchain = swapchain;
+    swp->format = fmt;
+    swp->image_count = (uint8_t)image_count;
+    swp->width = (uint16_t)extent.width;
+    swp->height = (uint16_t)extent.height;
 
     // Get images
     VkImage images[image_count];
-    result = vkGetSwapchainImagesKHR(dev->device, swapchain, &image_count, images);
+    result = vkGetSwapchainImagesKHR(device, swapchain, &image_count, images);
     if (result != VK_SUCCESS) {
         log_fatal("vkGetSwapchainImagesKHR failed: %d", (int)result);
         abort();
     }
+    for (unsigned i = 0, n = image_count; i < n; ++i) {
+        swp->images[i].image = images[i];
+    }
 
     // Create image views
-    VkImageView image_views[image_count];
     for (unsigned i = 0, n = image_count; i < n; ++i) {
         VkImageViewCreateInfo create_info = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
             .pNext = NULL,
             .flags = 0,
-            .image = images[i],
+            .image = swp->images[i].image,
             .viewType = VK_IMAGE_VIEW_TYPE_2D,
             .format = format,
             .components = {
@@ -1398,51 +1325,29 @@ static void cgvk_init_swapchain(const cgvk_Device* dev, cgvk_ImagePool* imgpool,
                 .layerCount = 1,
             },
         };
-        result = vkCreateImageView(dev->device, &create_info, NULL, &image_views[i]);
+        result = vkCreateImageView(device, &create_info, NULL, &swp->images[i].image_view);
         if (result != VK_SUCCESS) {
             log_fatal("vkCreateImageView failed: %d", (int)result);
             abort();
         }
     }
 
-    assert(extent.width < UINT16_MAX);
-    assert(extent.height < UINT16_MAX);
-
-    // Fill the fields
-    swp->dev = dev;
-    swp->swapchain = swapchain;
-    swp->format = fmt;
-    swp->image_count = (uint8_t)image_count;
-    swp->width = (uint16_t)extent.width;
-    swp->height = (uint16_t)extent.height;
-
-    // Init images
-    for (unsigned i = 0, n = image_count; i < n; ++i) {
-        cgvk_Image* img = cgvk_allocate_image(imgpool);
-        img->image = images[i];
-        img->image_view = image_views[i];
-        img->format = fmt;
-        img->width = (uint16_t)extent.width;
-        img->height = (uint16_t)extent.height;
-        img->depth = 1;
-        img->levels = 1;
-        img->layers = 1;
-        img->aspect_color = 1;
-        swp->images[i] = img;
-    }
+    return swp;
 }
 
-static void cgvk_kill_swapchain(cgvk_Swapchain* swp)
+static void cgvk_free_swapchain(cgvk_Swapchain* swp)
 {
+    VkDevice device = swp->dev->device;
+
     for (int i = 0, n = swp->image_count; i < n; ++i) {
-        cgvk_free_image(swp->images[i]);
+        vkDestroyImageView(device, swp->images[i].image_view, NULL);
     }
 
     if (swp->swapchain) {
-        vkDestroySwapchainKHR(swp->dev->device, swp->swapchain, NULL);
+        vkDestroySwapchainKHR(device, swp->swapchain, NULL);
     }
 
-    memset(swp, 0, sizeof(cgvk_Swapchain));
+    free(swp);
 }
 
 // ============================================================================
@@ -1899,8 +1804,8 @@ static void cgvk_init_surface()
 }
 
 static cgvk_Device dev_;
-static cgvk_Swapchain swp_;
-static cgvk_Renderer rnd_;
+static cgvk_Swapchain* swp_;
+static cgvk_Renderer* rnd_;
 
 CGVK_API void cgvk_init(const char* appname)
 {
@@ -1932,12 +1837,8 @@ CGVK_API void cgvk_init(const char* appname)
 
     //
     cgvk_init_device(&dev_);
-    rnd_.images = cgvk_new_image_pool(&dev_, 1024);
-    cgvk_init_swapchain(&dev_, rnd_.images, &swp_);
-    cgvk_init_main_render_pass(&dev_, &swp_, rnd_.images, &rnd_.rp);
-    cgvk_init_frame_list(&dev_, &swp_, &rnd_.frames);
-    rnd_.dev = &dev_;
-    rnd_.swp = &swp_;
+    swp_ = cgvk_new_swapchain(&dev_);
+    rnd_ = cgvk_new_renderer(&dev_, swp_);
 }
 
 CGVK_API void cgvk_quit()
@@ -1951,10 +1852,8 @@ CGVK_API void cgvk_quit()
     }
 
     //
-    cgvk_kill_frame_list(&rnd_.frames);
-    cgvk_kill_main_render_pass(&rnd_.rp);
-    cgvk_kill_swapchain(&swp_);
-    cgvk_free_image_pool(rnd_.images);
+    cgvk_free_renderer(rnd_);
+    cgvk_free_swapchain(swp_);
     cgvk_kill_device(&dev_);
 
     // Destroy surface and window
@@ -1997,9 +1896,7 @@ CGVK_API bool cgvk_pump_events()
 
 CGVK_API void cgvk_render()
 {
-    cgvk_begin_frame(&rnd_.frames);
-    cgvk_render_frame(&rnd_);
-    cgvk_end_frame(&rnd_.frames);
+    cgvk_render_frame(rnd_);
 }
 
 static VkInstance cgvk_get_instance()
