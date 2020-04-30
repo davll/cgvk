@@ -305,11 +305,13 @@ static void cgvk_allocate_transient_block(cgvk_TransientAllocator* talloc, size_
         talloc->pending = node;
     }
 
+    // fill the return values
     block->buffer = node->buffer;
     block->offset = node->used;
     block->size = (uint32_t)size;
     block->mapped = (uint8_t*)node->mapped + node->used;
 
+    // update the buffer node
     node->used += (uint32_t)size;
 }
 
@@ -319,6 +321,7 @@ static cgvk_TransientAllocator* cgvk_new_transient_allocator(const cgvk_Device* 
 
     cgvk_TransientAllocator* talloc = (cgvk_TransientAllocator*)malloc(size);
 
+    // initialize
     memset(talloc, 0, size);
     talloc->dev = dev;
     talloc->buffer_size = buffer_size;
@@ -335,6 +338,7 @@ static void cgvk_free_transient_allocator(cgvk_TransientAllocator* talloc)
 {
     VmaAllocator allocator = talloc->dev->allocator;
 
+    // destroy all buffers and allocations
     for (unsigned i = 0, n = talloc->count; i < n; ++i) {
         cgvk_TransientBuffer* tbuf = &talloc->buffers[i];
         vmaDestroyBuffer(allocator, tbuf->buffer, tbuf->memory);
@@ -369,52 +373,68 @@ static void cgvk_touch_shader(cgvk_ShaderCache* cache, cgvk_Shader* sh)
     cache->newest = sh;
 }
 
+static cgvk_Shader* cgvk_insert_shader(cgvk_ShaderCache* cache, XXH64_hash_t key, size_t size, const void* code)
+{
+    VkDevice device = cache->dev->device;
+    cgvk_Shader* sh;
+
+    if (cache->count < cache->capacity) {
+        // allocate new space
+        sh = &cache->objects[cache->count++];
+    } else {
+        // purge and destroy the oldest shader
+        assert(cache->oldest);
+        assert(cache->oldest != cache->newest);
+        assert(cache->oldest->next);
+        sh = cache->oldest;
+        cache->oldest = sh->next;
+        cache->oldest->prev = NULL;
+        sh->next = NULL;
+        vkDestroyShaderModule(device, sh->module, NULL);
+    }
+    
+    // initialize
+    memset(sh, 0, sizeof(cgvk_Shader));
+    memcpy(&sh->key, &key, sizeof(XXH64_hash_t));
+
+    // add to the table
+    HASH_ADD(hh, cache->head, key, sizeof(XXH64_hash_t), sh);
+
+    // push to the tail of the list
+    sh->prev = cache->newest;
+    if (cache->newest)
+        cache->newest->next = sh;
+    else
+        cache->oldest = sh;
+    cache->newest = sh;
+
+    VkShaderModuleCreateInfo create_info = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .pNext = NULL,
+        .flags = 0,
+        .codeSize = size,
+        .pCode = (const uint32_t*)code,
+    };
+
+    VkResult result = vkCreateShaderModule(device, &create_info, NULL, &sh->module);
+    if (result != VK_SUCCESS) {
+        log_fatal("vkCreateShaderModule failed: %d", (int)result);
+        abort();
+    }
+
+    return sh;
+}
+
 static cgvk_Shader* cgvk_get_shader_by_code(cgvk_ShaderCache* cache, size_t size, const void* code)
 {
     XXH64_hash_t key = XXH64(code, size, 0);
     cgvk_Shader* sh = NULL;
     HASH_FIND(hh, cache->head, &key, sizeof(XXH64_hash_t), sh);
 
-    VkDevice device = cache->dev->device;
-
     if (sh) {
         cgvk_touch_shader(cache, sh);
     } else {
-        if (cache->count < cache->capacity) {
-            sh = &cache->objects[cache->count++];
-        } else { // purge oldest
-            assert(cache->oldest);
-            assert(cache->oldest != cache->newest);
-            assert(cache->oldest->next);
-            sh = cache->oldest;
-            cache->oldest = cache->oldest->next;
-            cache->oldest->prev = NULL;
-            vkDestroyShaderModule(device, sh->module, NULL);
-        }
-        
-        memset(sh, 0, sizeof(cgvk_Shader));
-        memcpy(&sh->key, &key, sizeof(XXH64_hash_t));
-        HASH_ADD(hh, cache->head, key, sizeof(XXH64_hash_t), sh);
-        sh->prev = cache->newest;
-        if (cache->newest)
-            cache->newest->next = sh;
-        else
-            cache->oldest = sh;
-        cache->newest = sh;
-
-        VkShaderModuleCreateInfo create_info = {
-            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-            .pNext = NULL,
-            .flags = 0,
-            .codeSize = size,
-            .pCode = (const uint32_t*)code,
-        };
-
-        VkResult result = vkCreateShaderModule(device, &create_info, NULL, &sh->module);
-        if (result != VK_SUCCESS) {
-            log_fatal("vkCreateShaderModule failed: %d", (int)result);
-            abort();
-        }
+        sh = cgvk_insert_shader(cache, key, size, code);
     }
 
     return sh;
@@ -426,6 +446,7 @@ static cgvk_ShaderCache* cgvk_new_shader_cache(const cgvk_Device* dev, uint32_t 
 
     cgvk_ShaderCache* cache = (cgvk_ShaderCache*)malloc(size);
 
+    // initialize
     memset(cache, 0, size);
     cache->dev = dev;
     cache->capacity = capacity;
@@ -440,6 +461,7 @@ static void cgvk_free_shader_cache(cgvk_ShaderCache* cache)
 {
     VkDevice device = cache->dev->device;
 
+    // destroy all shader modules
     for (unsigned i = 0, n = cache->count; i < n; ++i) {
         if (cache->objects[i].module)
             vkDestroyShaderModule(device, cache->objects[i].module, NULL);
@@ -587,13 +609,36 @@ static VkPipeline cgvk_new_hello_triangle_pipeline(const cgvk_Device* dev, VkPip
         },
     };
 
+    VkVertexInputBindingDescription vbs[1] = {
+        {
+            .binding = 0,
+            .stride = 16,
+            .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+        },
+    };
+
+    VkVertexInputAttributeDescription vas[2] = {
+        {
+            .location = 0,
+            .binding = 0,
+            .format = VK_FORMAT_R32G32B32_SFLOAT,
+            .offset = 0,
+        },
+        {
+            .location = 1,
+            .binding = 0,
+            .format = VK_FORMAT_B8G8R8A8_UNORM,
+            .offset = 12,
+        },
+    };
+
     VkPipelineVertexInputStateCreateInfo vi = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
         .pNext = NULL,
-        .vertexBindingDescriptionCount = 0,
-        .pVertexBindingDescriptions = NULL,
-        .vertexAttributeDescriptionCount = 0,
-        .pVertexAttributeDescriptions = NULL,
+        .vertexBindingDescriptionCount = 1,
+        .pVertexBindingDescriptions = vbs,
+        .vertexAttributeDescriptionCount = 2,
+        .pVertexAttributeDescriptions = vas,
     };
 
     VkPipelineInputAssemblyStateCreateInfo ia = {
@@ -1019,11 +1064,37 @@ static void cgvk_draw_frame(cgvk_Renderer* rnd, uint32_t fidx)
 
     cgvk_begin_render_pass(rnd, fidx, cmdbuf);
 
-    cgvk_TransientBlock block;
-    cgvk_allocate_transient_block(rnd->talloc, 1024 * 1024, &block);
-
     vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, rnd->hello_triangle_pipeline);
     cgvk_set_viewport_and_scissor(rnd, fidx, cmdbuf);
+
+    // upload vertex data
+    {
+        cgvk_TransientBlock block;
+        cgvk_allocate_transient_block(rnd->talloc, 16 * 3, &block);
+
+        // fill vertex data
+        union uf {
+            float f;
+            uint32_t u;
+        };
+        union uf* p = (union uf*)block.mapped;
+        p[0].f = 0.5f;
+        p[1].f = -0.5f;
+        p[2].f = 0.0f;
+        p[3].u = 0xFFFF0000;
+        p[4].f = 0.5f;
+        p[5].f = 0.5f;
+        p[6].f = 0.0f;
+        p[7].u = 0xFF00FF00;
+        p[8].f = -0.5f;
+        p[9].f = 0.5f;
+        p[10].f = 0.0f;
+        p[11].u = 0xFF0000FF;
+
+        VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(cmdbuf, 0, 1, &block.buffer, &offset);
+    }
+
     vkCmdDraw(cmdbuf, 3, 1, 0, 0);
 
     cgvk_end_render_pass(rnd, fidx, cmdbuf);
