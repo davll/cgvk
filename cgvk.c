@@ -92,10 +92,8 @@ typedef struct cgvk_TransientAllocator {
     uint16_t capacity;
     uint16_t count;
     VkBufferUsageFlags usage;
-    cgvk_TransientBuffer* pending_head;
-    cgvk_TransientBuffer* pending_tail;
-    cgvk_TransientBuffer* used_head;
-    cgvk_TransientBuffer* used_tail;
+    cgvk_TransientBuffer* pending;
+    cgvk_TransientBuffer* submitted;
     cgvk_TransientBuffer* free;
     cgvk_TransientBuffer buffers[];
 } cgvk_TransientAllocator;
@@ -161,145 +159,158 @@ static VkImageLayout cgvk_decode_image_layout(cgvk_ImageLayout l);
 
 // ============================================================================
 
+static void cgvk_map_transient_buffer(cgvk_TransientAllocator* talloc, cgvk_TransientBuffer* tbuf)
+{
+    assert(!tbuf->mapped);
+
+    VkResult result = vmaMapMemory(talloc->dev->allocator, tbuf->memory, &tbuf->mapped);
+    if (result != VK_SUCCESS) {
+        log_fatal("vmaMapMemory failed: %d", (int)result);
+        abort();
+    }
+}
+
+static void cgvk_unmap_transient_buffer(cgvk_TransientAllocator* talloc, cgvk_TransientBuffer* tbuf)
+{
+    assert(tbuf->mapped);
+
+    VmaAllocator allocator = talloc->dev->allocator;
+
+    if (!(tbuf->properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+        vmaFlushAllocation(allocator, tbuf->memory, 0, tbuf->used);
+    }
+
+    vmaUnmapMemory(allocator, tbuf->memory);
+    tbuf->mapped = NULL;
+}
+
+static cgvk_TransientBuffer* cgvk_new_transient_buffer(cgvk_TransientAllocator* talloc)
+{
+    assert(talloc->count < talloc->capacity);
+
+    VmaAllocator allocator = talloc->dev->allocator;
+
+    cgvk_TransientBuffer* tbuf;
+
+    tbuf = &talloc->buffers[talloc->count++];
+    memset(tbuf, 0, sizeof(cgvk_TransientBuffer));
+    tbuf->mapped = NULL;
+    tbuf->next = NULL;
+
+    VkBufferCreateInfo create_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .pNext = NULL,
+        .flags = 0,
+        .size = talloc->buffer_size,
+        .usage = talloc->usage,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = NULL,
+    };
+
+    VmaAllocationCreateInfo alloc_info = {
+        .flags = VMA_ALLOCATION_CREATE_STRATEGY_BEST_FIT_BIT,
+        .usage = VMA_MEMORY_USAGE_CPU_TO_GPU,
+        .requiredFlags = 0,
+        .preferredFlags = 0,
+        .memoryTypeBits = 0,
+        .pool = VK_NULL_HANDLE,
+        .pUserData = NULL,
+    };
+
+    VmaAllocationInfo info;
+    VkResult result = vmaCreateBuffer(allocator, &create_info, &alloc_info, &tbuf->buffer, &tbuf->memory, &info);
+    if (result != VK_SUCCESS) {
+        log_fatal("vmaCreateBuffer failed: %d", (int)result);
+        abort();
+    }
+
+    uint32_t mem_type = info.memoryType;
+    vmaGetMemoryTypeProperties(allocator, mem_type, &tbuf->properties);
+
+    return tbuf;
+}
+
 static void cgvk_reset_transient_buffers(cgvk_TransientAllocator* talloc, uint32_t tag)
 {
-    VmaAllocator allocator = talloc->dev->allocator;
-
-    cgvk_TransientBuffer* src = talloc->used_head;
-    cgvk_TransientBuffer *head = NULL, *tail = NULL, *tmp;
-    while (src) {
-        tmp = src->next;
-        src->next = NULL;
-        if (src->tag == tag) {
-            if (src->mapped) {
-                vmaUnmapMemory(allocator, src->memory);
-                src->mapped = NULL;
-            }
-            src->tag = 0;
-            src->used = 0;
-            src->next = talloc->free;
-            talloc->free = src;
-        } else if (tail) {
-            tail->next = src;
-            tail = src;
+    cgvk_TransientBuffer *node = talloc->submitted, *head = NULL, *tmp;
+    while (node) {
+        tmp = node->next;
+        if (node->tag == tag) {
+            node->tag = 0;
+            node->used = 0;
+            // push to free list
+            node->next = talloc->free;
+            talloc->free = node;
         } else {
-            head = tail = src;
+            // keep the node
+            node->next = head;
+            head = node;
         }
-        src = tmp;
+        node = tmp;
     }
-    talloc->used_head = head;
-    talloc->used_tail = tail;
+    talloc->submitted = head;
 }
 
-static void cgvk_submit_transient_buffers(cgvk_TransientAllocator* talloc)
+static void cgvk_submit_transient_buffers(cgvk_TransientAllocator* talloc, uint32_t tag)
 {
-    VmaAllocator allocator = talloc->dev->allocator;
-
-    cgvk_TransientBuffer *cur = talloc->pending_head;
-    while (cur) {
-        if (cur->mapped) {
-            if (!(cur->properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
-                vmaFlushAllocation(allocator, cur->memory, 0, cur->used);
-            }
-            vmaUnmapMemory(allocator, cur->memory);
-            cur->mapped = NULL;
+    cgvk_TransientBuffer *node = talloc->pending, *tmp;
+    while (node) {
+        tmp = node->next;
+        {
+            // change mode
+            cgvk_unmap_transient_buffer(talloc, node);
+            node->tag = tag;
+            // push to submitted list
+            node->next = talloc->submitted;
+            talloc->submitted = node;
         }
-        cur = cur->next;
+        node = tmp;
     }
 
-    if (talloc->used_tail) {
-        talloc->used_tail->next = talloc->pending_head;
-        talloc->used_tail = talloc->pending_tail;
-    } else {
-        talloc->used_head = talloc->pending_head;
-        talloc->used_tail = talloc->pending_tail;
-    }
-    talloc->pending_tail = talloc->pending_head = NULL;
+    // the pending list is empty now
+    talloc->pending = NULL;
 }
 
-static void cgvk_allocate_transient_block(cgvk_TransientAllocator* talloc, uint32_t tag, size_t size, cgvk_TransientBlock* block)
+static void cgvk_allocate_transient_block(cgvk_TransientAllocator* talloc, size_t size, cgvk_TransientBlock* block)
 {
     assert(size <= talloc->buffer_size);
 
-    VmaAllocator allocator = talloc->dev->allocator;
+    cgvk_TransientBuffer *node;
 
-    cgvk_TransientBuffer *cur = talloc->pending_head;
-    while (cur) {
-        if (cur->tag == tag && cur->used + size <= talloc->buffer_size) {
+    // find available space in pending list
+    for (node = talloc->pending; node; node = node->next) {
+        if (node->used + size <= talloc->buffer_size) {
+            // found
             break;
         }
-        cur = cur->next;
     }
+    // node = NULL if not found
 
-    if (!cur) {
+    // create new pending 
+    if (!node) {
         if (talloc->free) {
-            cur = talloc->free;
-            talloc->free = talloc->free->next;
+            // extract from free list
+            node = talloc->free;
+            talloc->free = node->next;
+            node->next = NULL;
         } else {
-            assert(talloc->count < talloc->capacity);
-            cur = &talloc->buffers[talloc->count++];
-            memset(cur, 0, sizeof(cgvk_TransientBuffer));
-            cur->mapped = NULL;
-            
-            VkBufferCreateInfo create_info = {
-                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                .pNext = NULL,
-                .flags = 0,
-                .size = talloc->buffer_size,
-                .usage = talloc->usage,
-                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                .queueFamilyIndexCount = 0,
-                .pQueueFamilyIndices = NULL,
-            };
-
-            VmaAllocationCreateInfo alloc_info = {
-                .flags = VMA_ALLOCATION_CREATE_STRATEGY_BEST_FIT_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
-                .usage = VMA_MEMORY_USAGE_CPU_TO_GPU,
-                .requiredFlags = 0,
-                .preferredFlags = 0,
-                .memoryTypeBits = 0,
-                .pool = VK_NULL_HANDLE,
-                .pUserData = NULL,
-            };
-
-            VmaAllocationInfo info;
-            VkResult result = vmaCreateBuffer(allocator, &create_info, &alloc_info, &cur->buffer, &cur->memory, &info);
-            if (result != VK_SUCCESS) {
-                log_fatal("vmaCreateBuffer failed: %d", (int)result);
-                abort();
-            }
-
-            uint32_t mem_type = info.memoryType;
-            vmaGetMemoryTypeProperties(allocator, mem_type, &cur->properties);
-
-            cur->mapped = info.pMappedData;
+            node = cgvk_new_transient_buffer(talloc);
         }
 
-        cur->tag = tag;
-        cur->next = NULL;
+        cgvk_map_transient_buffer(talloc, node);
 
-        if (talloc->pending_tail) {
-            talloc->pending_tail->next = cur;
-            talloc->pending_tail = cur;
-        } else {
-            talloc->pending_head = talloc->pending_tail = cur;
-        }
+        // push to pending list
+        node->next = talloc->pending;
+        talloc->pending = node;
     }
 
-    if (!cur->mapped) {
-        VkResult result = vmaMapMemory(allocator, cur->memory, &cur->mapped);
-        if (result != VK_SUCCESS) {
-            log_fatal("vmaMapMemory failed: %d", (int)result);
-            abort();
-        }
-    }
-
-    block->buffer = cur->buffer;
-    block->offset = cur->used;
+    block->buffer = node->buffer;
+    block->offset = node->used;
     block->size = (uint32_t)size;
-    block->mapped = (uint8_t*)cur->mapped + cur->used;
+    block->mapped = (uint8_t*)node->mapped + node->used;
 
-    cur->used += (uint32_t)size;
+    node->used += (uint32_t)size;
 }
 
 static cgvk_TransientAllocator* cgvk_new_transient_allocator(const cgvk_Device* dev, uint32_t buffer_size, uint16_t capacity)
@@ -313,10 +324,8 @@ static cgvk_TransientAllocator* cgvk_new_transient_allocator(const cgvk_Device* 
     talloc->buffer_size = buffer_size;
     talloc->capacity = capacity;
     talloc->free = NULL;
-    talloc->pending_head = NULL;
-    talloc->pending_tail = NULL;
-    talloc->used_head = NULL;
-    talloc->used_tail = NULL;
+    talloc->pending = NULL;
+    talloc->submitted = NULL;
     talloc->usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
 
     return talloc;
@@ -837,17 +846,18 @@ static void cgvk_free_renderer(cgvk_Renderer* rnd)
         vkDestroyCommandPool(device, rnd->frames[i].main_command_pool, NULL);
     }
 
+    cgvk_free_transient_allocator(rnd->talloc);
+
     free(rnd->framebuffers);
-    free(rnd->talloc);
     free(rnd->frames);
     free(rnd);
 }
 
 // ============================================================================
 
-static inline size_t cgvk_get_current_frame_index(cgvk_Renderer* rnd)
+static inline uint32_t cgvk_get_current_frame_index(cgvk_Renderer* rnd)
 {
-    return rnd->current_frame % rnd->frame_count;
+    return (uint32_t) (rnd->current_frame % rnd->frame_count);
 }
 
 static void cgvk_advance_next_frame(cgvk_Renderer* rnd)
@@ -856,7 +866,7 @@ static void cgvk_advance_next_frame(cgvk_Renderer* rnd)
     rnd->current_frame++;
 }
 
-static void cgvk_acquire_swapchain_image(cgvk_Renderer* rnd, size_t fidx)
+static void cgvk_acquire_swapchain_image(cgvk_Renderer* rnd, uint32_t fidx)
 {
     VkResult result = vkAcquireNextImageKHR(rnd->dev->device, rnd->swp->swapchain, UINT64_MAX, rnd->frames[fidx].acquire_next_image_semaphore, VK_NULL_HANDLE, &rnd->frames[fidx].present_image_index);
     if (result != VK_SUCCESS) {
@@ -865,7 +875,7 @@ static void cgvk_acquire_swapchain_image(cgvk_Renderer* rnd, size_t fidx)
     }
 }
 
-static VkCommandBuffer cgvk_begin_main_command_buffer(cgvk_Renderer* rnd, size_t fidx)
+static VkCommandBuffer cgvk_begin_main_command_buffer(cgvk_Renderer* rnd, uint32_t fidx)
 {
     VkResult result;
     VkCommandBuffer cmdbuf;
@@ -900,7 +910,7 @@ static VkCommandBuffer cgvk_begin_main_command_buffer(cgvk_Renderer* rnd, size_t
     return cmdbuf;
 }
 
-static void cgvk_end_main_command_buffer(cgvk_Renderer* rnd, size_t fidx, VkCommandBuffer cmdbuf)
+static void cgvk_end_main_command_buffer(cgvk_Renderer* rnd, uint32_t fidx, VkCommandBuffer cmdbuf)
 {
     VkResult result;
 
@@ -943,7 +953,7 @@ static void cgvk_end_main_command_buffer(cgvk_Renderer* rnd, size_t fidx, VkComm
     }
 }
 
-static void cgvk_begin_render_pass(cgvk_Renderer* rnd, size_t fidx, VkCommandBuffer cmdbuf)
+static void cgvk_begin_render_pass(cgvk_Renderer* rnd, uint32_t fidx, VkCommandBuffer cmdbuf)
 {
     uint32_t clear_value_count = 1;
     VkClearValue clear_values[1] = {
@@ -970,7 +980,7 @@ static void cgvk_begin_render_pass(cgvk_Renderer* rnd, size_t fidx, VkCommandBuf
     vkCmdBeginRenderPass(cmdbuf, &main_rp_begin, VK_SUBPASS_CONTENTS_INLINE);
 }
 
-static void cgvk_end_render_pass(cgvk_Renderer* rnd, size_t fidx, VkCommandBuffer cmdbuf)
+static void cgvk_end_render_pass(cgvk_Renderer* rnd, uint32_t fidx, VkCommandBuffer cmdbuf)
 {
     (void)rnd;
     (void)fidx;
@@ -978,7 +988,7 @@ static void cgvk_end_render_pass(cgvk_Renderer* rnd, size_t fidx, VkCommandBuffe
     vkCmdEndRenderPass(cmdbuf);
 }
 
-static void cgvk_set_viewport_and_scissor(cgvk_Renderer* rnd, size_t fidx, VkCommandBuffer cmdbuf)
+static void cgvk_set_viewport_and_scissor(cgvk_Renderer* rnd, uint32_t fidx, VkCommandBuffer cmdbuf)
 {
     (void)fidx;
 
@@ -1003,20 +1013,26 @@ static void cgvk_set_viewport_and_scissor(cgvk_Renderer* rnd, size_t fidx, VkCom
     vkCmdSetScissor(cmdbuf, 0, 1, scissors);
 }
 
-static void cgvk_draw_frame(cgvk_Renderer* rnd, size_t fidx)
+static void cgvk_draw_frame(cgvk_Renderer* rnd, uint32_t fidx)
 {
     VkCommandBuffer cmdbuf = cgvk_begin_main_command_buffer(rnd, fidx);
+
     cgvk_begin_render_pass(rnd, fidx, cmdbuf);
+
+    cgvk_TransientBlock block;
+    cgvk_allocate_transient_block(rnd->talloc, 1024 * 1024, &block);
 
     vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, rnd->hello_triangle_pipeline);
     cgvk_set_viewport_and_scissor(rnd, fidx, cmdbuf);
     vkCmdDraw(cmdbuf, 3, 1, 0, 0);
 
     cgvk_end_render_pass(rnd, fidx, cmdbuf);
+
+    cgvk_submit_transient_buffers(rnd->talloc, fidx);
     cgvk_end_main_command_buffer(rnd, fidx, cmdbuf);
 }
 
-static void cgvk_present_frame(cgvk_Renderer* rnd, size_t fidx)
+static void cgvk_present_frame(cgvk_Renderer* rnd, uint32_t fidx)
 {
     uint32_t wait_semaphore_count = 1;
     VkSemaphore wait_semaphores[] = {
@@ -1043,7 +1059,7 @@ static void cgvk_present_frame(cgvk_Renderer* rnd, size_t fidx)
     }
 }
 
-static void cgvk_wait_frame(cgvk_Renderer* rnd, size_t fidx)
+static void cgvk_wait_frame(cgvk_Renderer* rnd, uint32_t fidx)
 {
     VkResult result = vkWaitForFences(rnd->dev->device, 1, &rnd->frames[fidx].fence, VK_TRUE, UINT64_MAX);
     if (result != VK_SUCCESS) {
@@ -1052,7 +1068,7 @@ static void cgvk_wait_frame(cgvk_Renderer* rnd, size_t fidx)
     }
 }
 
-static void cgvk_reset_frame(cgvk_Renderer* rnd, size_t fidx)
+static void cgvk_reset_frame(cgvk_Renderer* rnd, uint32_t fidx)
 {
     VkResult result;
     VkDevice device = rnd->dev->device;
@@ -1063,12 +1079,14 @@ static void cgvk_reset_frame(cgvk_Renderer* rnd, size_t fidx)
         abort();
     }
 
+    cgvk_reset_transient_buffers(rnd->talloc, fidx);
+
     rnd->frames[fidx].present_image_index = UINT32_MAX;
 }
 
 static void cgvk_render_frame(cgvk_Renderer* rnd)
 {
-    size_t fidx = cgvk_get_current_frame_index(rnd);
+    uint32_t fidx = cgvk_get_current_frame_index(rnd);
 
     cgvk_acquire_swapchain_image(rnd, fidx);
     cgvk_draw_frame(rnd, fidx);
