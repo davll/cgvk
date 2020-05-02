@@ -148,7 +148,8 @@ typedef struct cgvk_Renderer {
     VkPipelineLayout empty_pipeline_layout;
     VkPipeline hello_triangle_pipeline;
     VkFramebuffer* framebuffers;
-    cgvk_TransientAllocator* talloc;
+    cgvk_TransientAllocator* transient_vertex_buffers;
+    cgvk_TransientAllocator* transient_uniform_buffers;
     cgvk_Frame* frames;
 } cgvk_Renderer;
 
@@ -192,6 +193,7 @@ static cgvk_TransientBuffer* cgvk_new_transient_buffer(cgvk_TransientAllocator* 
 
     cgvk_TransientBuffer* tbuf;
 
+    // intialize structure
     tbuf = &talloc->buffers[talloc->count++];
     memset(tbuf, 0, sizeof(cgvk_TransientBuffer));
     tbuf->mapped = NULL;
@@ -315,7 +317,7 @@ static void cgvk_allocate_transient_block(cgvk_TransientAllocator* talloc, size_
     node->used += (uint32_t)size;
 }
 
-static cgvk_TransientAllocator* cgvk_new_transient_allocator(const cgvk_Device* dev, uint32_t buffer_size, uint16_t capacity)
+static cgvk_TransientAllocator* cgvk_new_transient_allocator(const cgvk_Device* dev, uint32_t buffer_size, uint16_t capacity, VkBufferUsageFlags usage)
 {
     size_t size = sizeof(cgvk_TransientAllocator) + sizeof(cgvk_TransientBuffer) * capacity;
 
@@ -329,7 +331,7 @@ static cgvk_TransientAllocator* cgvk_new_transient_allocator(const cgvk_Device* 
     talloc->free = NULL;
     talloc->pending = NULL;
     talloc->submitted = NULL;
-    talloc->usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+    talloc->usage = usage;
 
     return talloc;
 }
@@ -358,6 +360,7 @@ static void cgvk_touch_shader(cgvk_ShaderCache* cache, cgvk_Shader* sh)
     assert(cache->newest);
     assert(cache->oldest != cache->newest);
 
+    // purge the node from the list
     if (sh->prev) {
         sh->prev->next = sh->next;
         sh->next->prev = sh->prev;
@@ -367,6 +370,7 @@ static void cgvk_touch_shader(cgvk_ShaderCache* cache, cgvk_Shader* sh)
         cache->oldest->prev = NULL;
     }
 
+    // push the node to the tail of the list
     sh->next = NULL;
     sh->prev = cache->newest;
     cache->newest->next = sh;
@@ -865,7 +869,8 @@ static cgvk_Renderer* cgvk_new_renderer(const cgvk_Device* dev, const cgvk_Swapc
     rnd->empty_pipeline_layout = cgvk_new_empty_pipeline_layout(dev);
     rnd->hello_triangle_pipeline = cgvk_new_hello_triangle_pipeline(dev, rnd->empty_pipeline_layout, rnd->render_pass);
     rnd->framebuffers = cgvk_new_framebuffers(dev, swp, rnd->render_pass);
-    rnd->talloc = cgvk_new_transient_allocator(dev, 1024 * 1024 * 2, 16);
+    rnd->transient_vertex_buffers = cgvk_new_transient_allocator(dev, 1024 * 1024 * 2, 16, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    rnd->transient_uniform_buffers = cgvk_new_transient_allocator(dev, 1024 * 4, 128, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
     rnd->frames = cgvk_new_frames(dev, rnd->frame_count);
 
     return rnd;
@@ -891,7 +896,8 @@ static void cgvk_free_renderer(cgvk_Renderer* rnd)
         vkDestroyCommandPool(device, rnd->frames[i].main_command_pool, NULL);
     }
 
-    cgvk_free_transient_allocator(rnd->talloc);
+    cgvk_free_transient_allocator(rnd->transient_vertex_buffers);
+    cgvk_free_transient_allocator(rnd->transient_uniform_buffers);
 
     free(rnd->framebuffers);
     free(rnd->frames);
@@ -1070,7 +1076,7 @@ static void cgvk_draw_frame(cgvk_Renderer* rnd, uint32_t fidx)
     // upload vertex data
     {
         cgvk_TransientBlock block;
-        cgvk_allocate_transient_block(rnd->talloc, 16 * 3, &block);
+        cgvk_allocate_transient_block(rnd->transient_vertex_buffers, 16 * 3, &block);
 
         // fill vertex data
         union uf {
@@ -1099,7 +1105,7 @@ static void cgvk_draw_frame(cgvk_Renderer* rnd, uint32_t fidx)
 
     cgvk_end_render_pass(rnd, fidx, cmdbuf);
 
-    cgvk_submit_transient_buffers(rnd->talloc, fidx);
+    cgvk_submit_transient_buffers(rnd->transient_vertex_buffers, fidx);
     cgvk_end_main_command_buffer(rnd, fidx, cmdbuf);
 }
 
@@ -1150,7 +1156,7 @@ static void cgvk_reset_frame(cgvk_Renderer* rnd, uint32_t fidx)
         abort();
     }
 
-    cgvk_reset_transient_buffers(rnd->talloc, fidx);
+    cgvk_reset_transient_buffers(rnd->transient_vertex_buffers, fidx);
 
     rnd->frames[fidx].present_image_index = UINT32_MAX;
 }
