@@ -1075,27 +1075,30 @@ static void cgvk_draw_frame(cgvk_Renderer* rnd, uint32_t fidx)
 
     // upload vertex data
     {
+        struct vertex {
+            float x;
+            float y;
+            float z;
+            uint32_t c;
+        };
+
         cgvk_TransientBlock block;
-        cgvk_allocate_transient_block(rnd->transient_vertex_buffers, 16 * 3, &block);
+        cgvk_allocate_transient_block(rnd->transient_vertex_buffers, sizeof(struct vertex) * 3, &block);
 
         // fill vertex data
-        union uf {
-            float f;
-            uint32_t u;
-        };
-        union uf* p = (union uf*)block.mapped;
-        p[0].f = 0.5f;
-        p[1].f = -0.5f;
-        p[2].f = 0.0f;
-        p[3].u = 0xFFFF0000;
-        p[4].f = 0.5f;
-        p[5].f = 0.5f;
-        p[6].f = 0.0f;
-        p[7].u = 0xFF00FF00;
-        p[8].f = -0.5f;
-        p[9].f = 0.5f;
-        p[10].f = 0.0f;
-        p[11].u = 0xFF0000FF;
+        struct vertex* p = (struct vertex*)block.mapped;
+        p[0].x = 0.5f;
+        p[0].y = -0.5f;
+        p[0].z = 0.0f;
+        p[0].c = 0xFFFF0000;
+        p[1].x = 0.5f;
+        p[1].y = 0.5f;
+        p[1].z = 0.0f;
+        p[1].c = 0xFF00FF00;
+        p[2].x = -0.5f;
+        p[2].y = 0.5f;
+        p[2].z = 0.0f;
+        p[2].c = 0xFF0000FF;
 
         VkDeviceSize offset = 0;
         vkCmdBindVertexBuffers(cmdbuf, 0, 1, &block.buffer, &offset);
@@ -1106,6 +1109,7 @@ static void cgvk_draw_frame(cgvk_Renderer* rnd, uint32_t fidx)
     cgvk_end_render_pass(rnd, fidx, cmdbuf);
 
     cgvk_submit_transient_buffers(rnd->transient_vertex_buffers, fidx);
+    cgvk_submit_transient_buffers(rnd->transient_uniform_buffers, fidx);
     cgvk_end_main_command_buffer(rnd, fidx, cmdbuf);
 }
 
@@ -1157,6 +1161,7 @@ static void cgvk_reset_frame(cgvk_Renderer* rnd, uint32_t fidx)
     }
 
     cgvk_reset_transient_buffers(rnd->transient_vertex_buffers, fidx);
+    cgvk_reset_transient_buffers(rnd->transient_uniform_buffers, fidx);
 
     rnd->frames[fidx].present_image_index = UINT32_MAX;
 }
